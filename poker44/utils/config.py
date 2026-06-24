@@ -178,6 +178,14 @@ def add_miner_args(cls, parser: argparse.ArgumentParser) -> None:
 
 def check_config(cls, config: "bt.Config"):
     r"""Checks/validates the config namespace object."""
+    # Safety net: ensure the `neuron` namespace and its name exist even if the
+    # installed bittensor did not nest the custom dotted args.
+    default_name = "validator" if "valid" in str(getattr(cls, "neuron_type", "")).lower() else "miner"
+    if getattr(config, "neuron", None) is None:
+        config.neuron = bt.Config()
+    if not getattr(config.neuron, "name", None):
+        config.neuron.name = default_name
+
     full_path = os.path.expanduser(
         "{}/{}/{}/netuid{}/{}".format(
             config.logging.logging_dir,  # TODO: change from ~/.bittensor/miners to ~/.bittensor/neurons
@@ -199,7 +207,34 @@ def check_config(cls, config: "bt.Config"):
     #     bt.logging.register_primary_logger(events_logger.name)
 
 
+def _restore_dotted_namespaces(cfg: "bt.Config", parser: argparse.ArgumentParser) -> None:
+    """Rebuild nested namespaces for custom dotted CLI args (neuron.*, blacklist.*,
+    wandb.*).
+
+    Some bittensor releases only auto-nest their own known namespaces (subtensor,
+    wallet, axon, logging, ...) and leave custom dotted args flat, so ``cfg.neuron``
+    comes back as ``None``. We re-parse and fill any top-level namespace that the
+    Config left missing, without clobbering values bittensor already nested.
+    """
+    try:
+        parsed, _ = parser.parse_known_args()
+    except SystemExit:
+        return
+    for dest, value in vars(parsed).items():
+        if "." not in dest:
+            continue
+        top, sub = dest.split(".", 1)
+        node = getattr(cfg, top, None)
+        if node is None:
+            node = bt.Config()
+            setattr(cfg, top, node)
+        if getattr(node, sub, None) is None:
+            setattr(node, sub, value)
+
+
 def config(cls) -> bt.Config:
     parser = argparse.ArgumentParser()
     cls.add_args(parser)
-    return bt.Config(parser=parser)
+    cfg = bt.Config(parser=parser)
+    _restore_dotted_namespaces(cfg, parser)
+    return cfg
