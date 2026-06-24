@@ -148,6 +148,12 @@ def add_args(cls, parser: argparse.ArgumentParser) -> None:
 
 def add_validator_args(cls, parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "--neuron.name",
+        type=str,
+        default="validator",
+        help="Neuron name; used for the on-disk state path (~/.bittensor/.../<name>).",
+    )
+    parser.add_argument(
         "--validator.manual_players",
         nargs="*",
         default=[],
@@ -156,6 +162,12 @@ def add_validator_args(cls, parser: argparse.ArgumentParser) -> None:
 
 
 def add_miner_args(cls, parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--neuron.name",
+        type=str,
+        default="miner",
+        help="Neuron name; used for the on-disk state path (~/.bittensor/.../<name>).",
+    )
     parser.add_argument(
         "--miner.mock",
         action="store_true",
