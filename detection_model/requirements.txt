@@ -1,6 +1,13 @@
+# Core training / inference (model/*)
 torch
 numpy
-scikit-learn
-tqdm
-joblib
-xgboost
+scikit-learn      # metrics + isotonic calibration (model/scoring.py, model/calibration.py)
+xgboost           # final classifier head
+tqdm              # training progress
+joblib            # optional external XGBoost artifact loading
+
+# Data tooling (tools/get_dump.py)
+requests          # pull benchmark chunks from the Poker44 platform API
+
+# Dashboard (optional — only if you run detection_model/dashboard)
+# streamlit
