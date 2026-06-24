@@ -69,6 +69,11 @@ class FeatureVectorizer:
         "amount_bucket_signature_unique_share",
         "low_action_entropy_hand_rate",
         "high_aggression_hand_rate",
+        # Bet-sizing consistency: bots vary their sizing far less than humans.
+        # Only this one survived the temporal-holdout check (train<=06-08,
+        # test 06-09..06-13); the other sizing/determinism/CV candidates
+        # degraded held-out AP on this small dataset and were dropped.
+        "amount_cv",
     ]
 
     ACTIONS = {"fold", "check", "call", "bet", "raise", "all_in", "allin"}
@@ -143,6 +148,22 @@ class FeatureVectorizer:
         if denominator <= 0:
             return 0.0
         return max(0.0, min(float(numerator) / float(denominator), cap)) / cap
+
+    @staticmethod
+    def cv(values: List[float], cap: float = 3.0) -> float:
+        """Coefficient of variation (std/mean), normalized to [0, 1].
+
+        Low CV across a chunk = mechanically consistent behavior = bot-like.
+        Returns 0 for fewer than 2 samples or a ~zero mean.
+        """
+        vals = [float(v) for v in values]
+        if len(vals) < 2:
+            return 0.0
+        m = sum(vals) / len(vals)
+        if m <= 1e-9:
+            return 0.0
+        var = sum((v - m) ** 2 for v in vals) / len(vals)
+        return min(math.sqrt(max(0.0, var)) / m, cap) / cap
 
     @staticmethod
     def amount_bucket_label(amount_bb: float) -> str:
@@ -408,6 +429,10 @@ class FeatureVectorizer:
             ),
             "low_action_entropy_hand_rate": low_entropy_hands / num_hands,
             "high_aggression_hand_rate": high_aggression_hands / num_hands,
+            # Bet-sizing consistency (low CV = bot-like). Survived the
+            # temporal-holdout check; the other consistency candidates hurt
+            # held-out AP on this small dataset and were dropped.
+            "amount_cv": self.cv(amount_bbs),
         }
 
         values = np.asarray([float(feature_map.get(name, 0.0)) for name in self.feature_names], dtype=np.float32)
