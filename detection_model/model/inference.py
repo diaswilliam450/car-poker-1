@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -10,6 +12,38 @@ from .action_vectorizer import CAT_DIM, HAND_META_DIM, ActionVectorizer
 from .calibration import ScoreCalibrator
 from .features import FeatureVectorizer
 from .hierarchical_model import SCHEMA_VERSION, HierarchicalChunkClassifier
+
+
+def _alias_project_packages() -> None:
+    """Make pickled project classes resolve under both package roots.
+
+    Artifacts are typically trained via ``cd detection_model; python -m
+    model.train_hierarchical`` so project classes embedded in the ``.pt`` (e.g.
+    the stacked-ensemble head) are pickled under the top-level ``model.*``
+    package. The miner instead imports ``detection_model.model.*``. Without an
+    alias the unpickler raises ``ModuleNotFoundError: No module named 'model'``
+    and the miner silently drops to its heuristic fallback. Registering each
+    submodule under both roots in ``sys.modules`` lets the same artifact load
+    from either entry point.
+    """
+    this_pkg = __package__ or "model"
+    roots = {"model", "detection_model.model", this_pkg}
+    submodules = (
+        "stacked", "calibration", "features", "action_vectorizer",
+        "hierarchical_model", "inference", "scoring", "dataset",
+        "hierarchical_dataset",
+    )
+    pkg_obj = sys.modules.get(this_pkg)
+    for root in roots:
+        if pkg_obj is not None:
+            sys.modules.setdefault(root, pkg_obj)
+    for name in submodules:
+        try:
+            mod = importlib.import_module(f"{this_pkg}.{name}")
+        except Exception:
+            continue
+        for root in roots:
+            sys.modules.setdefault(f"{root}.{name}", mod)
 
 
 class Poker44BotDetector:
@@ -51,6 +85,7 @@ class Poker44BotDetector:
 
     @staticmethod
     def _torch_load_artifact(path: Path) -> Dict[str, Any]:
+        _alias_project_packages()
         try:
             artifact = torch.load(path, map_location="cpu", weights_only=False)
         except TypeError:
