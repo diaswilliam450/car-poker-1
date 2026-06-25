@@ -74,6 +74,21 @@ class FeatureVectorizer:
         # test 06-09..06-13); the other sizing/determinism/CV candidates
         # degraded held-out AP on this small dataset and were dropped.
         "amount_cv",
+        # Sizing-distribution shape (ported from the reference stacked model):
+        # bots cluster sizes tightly, so the spread (IQR) and upper tail (p90)
+        # of bet sizes carry signal beyond the mean/std already captured above.
+        "amount_iqr_bb_scaled",
+        "amount_p90_bb_scaled",
+        # Turn-taking / betting-rhythm tells (ported from the reference model).
+        # Bots tend to act in mechanical runs and with regular actor cadence:
+        #   - actor_switch_rate: how often the acting seat changes hand-to-action
+        #   - max_actor_run_norm: longest same-actor streak within a hand
+        #   - max_action_type_run_norm: longest identical-action streak
+        #   - long_action_hand_rate: share of unusually long (>=12 action) hands
+        "actor_switch_rate",
+        "max_actor_run_norm",
+        "max_action_type_run_norm",
+        "long_action_hand_rate",
     ]
 
     ACTIONS = {"fold", "check", "call", "bet", "raise", "all_in", "allin"}
@@ -166,6 +181,29 @@ class FeatureVectorizer:
         return min(math.sqrt(max(0.0, var)) / m, cap) / cap
 
     @staticmethod
+    def max_run(seq: List[Any]) -> int:
+        """Longest run of identical consecutive items (mechanical-repetition tell)."""
+        if not seq:
+            return 0
+        best = current = 1
+        for prev, item in zip(seq, seq[1:]):
+            if item == prev:
+                current += 1
+                if current > best:
+                    best = current
+            else:
+                current = 1
+        return best
+
+    @staticmethod
+    def switch_rate(seq: List[Any]) -> float:
+        """Fraction of adjacent positions where the value changes (cadence tell)."""
+        if len(seq) < 2:
+            return 0.0
+        switches = sum(1 for prev, item in zip(seq, seq[1:]) if item != prev)
+        return switches / (len(seq) - 1)
+
+    @staticmethod
     def amount_bucket_label(amount_bb: float) -> str:
         """Coarse BB-size bucket for cross-hand sizing-signature comparison."""
         value = max(0.0, float(amount_bb))
@@ -242,6 +280,10 @@ class FeatureVectorizer:
         amount_bucket_signatures: List[tuple] = []
         low_entropy_hands = 0
         high_aggression_hands = 0
+        long_action_hands = 0
+        actor_switch_values: List[float] = []
+        max_actor_run_values: List[float] = []
+        max_action_run_values: List[float] = []
 
         for hand in chunk:
             if not isinstance(hand, dict):
@@ -249,6 +291,7 @@ class FeatureVectorizer:
 
             this_hand_actions: List[str] = []
             this_hand_buckets: List[str] = []
+            this_hand_actors: List[int] = []
             this_hand_counter: Counter[str] = Counter()
 
             metadata = hand.get("metadata") or {}
@@ -313,6 +356,7 @@ class FeatureVectorizer:
                 action_counter[action_type] += 1
                 street_counter[street] += 1
                 actor_counter[f"seat_{actor}" if actor > 0 else "seat_unknown"] += 1
+                this_hand_actors.append(actor)
 
                 amount = self.safe_float(action.get("amount"), default=0.0)
                 normalized_amount_bb = self.safe_float(action.get("normalized_amount_bb"), default=0.0)
@@ -352,6 +396,11 @@ class FeatureVectorizer:
                 )
                 if aggressive / max(1, len(this_hand_actions)) >= 0.35:
                     high_aggression_hands += 1
+                if len(this_hand_actions) >= 12:
+                    long_action_hands += 1
+                actor_switch_values.append(self.switch_rate(this_hand_actors))
+                max_actor_run_values.append(self.max_run(this_hand_actors) / len(this_hand_actors))
+                max_action_run_values.append(self.max_run(this_hand_actions) / len(this_hand_actions))
 
         num_hands = max(1, len(chunk))
         total_actions = max(1, sum(action_counter.values()))
@@ -433,6 +482,19 @@ class FeatureVectorizer:
             # temporal-holdout check; the other consistency candidates hurt
             # held-out AP on this small dataset and were dropped.
             "amount_cv": self.cv(amount_bbs),
+            # Sizing-distribution shape (ported from the reference stacked model).
+            "amount_iqr_bb_scaled": self.scaled_log(
+                float(np.percentile(amount_bbs, 75) - np.percentile(amount_bbs, 25))
+                if len(amount_bbs) >= 2 else 0.0
+            ),
+            "amount_p90_bb_scaled": self.scaled_log(
+                float(np.percentile(amount_bbs, 90)) if amount_bbs else 0.0
+            ),
+            # Turn-taking / betting-rhythm tells (ported from the reference model).
+            "actor_switch_rate": self.mean(actor_switch_values),
+            "max_actor_run_norm": self.mean(max_actor_run_values),
+            "max_action_type_run_norm": self.mean(max_action_run_values),
+            "long_action_hand_rate": long_action_hands / num_hands,
         }
 
         values = np.asarray([float(feature_map.get(name, 0.0)) for name in self.feature_names], dtype=np.float32)

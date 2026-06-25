@@ -28,6 +28,7 @@ from .features import FeatureVectorizer
 from .hierarchical_dataset import HierarchicalPokerChunkDataset, hierarchical_collate_batch
 from .hierarchical_model import HierarchicalChunkClassifier
 from .scoring import format_reward_line, print_reward_diagnostics, reward_metrics
+from .stacked import StackedEnsemble
 
 
 def set_seed(seed: int) -> None:
@@ -148,6 +149,8 @@ def make_model(
         amount_bucket_vocab_size=action_vectorizer.amount_bucket_vocab_size,
         pot_flow_vocab_size=action_vectorizer.pot_flow_vocab_size,
         first_in_street_vocab_size=action_vectorizer.first_in_street_vocab_size,
+        actor_role_vocab_size=action_vectorizer.actor_role_vocab_size,
+        street_position_vocab_size=action_vectorizer.street_position_vocab_size,
         hand_end_vocab_size=action_vectorizer.hand_end_vocab_size,
         hand_meta_dim=action_vectorizer.hand_meta_dim,
         max_actions_per_hand=args.max_actions_per_hand,
@@ -379,6 +382,45 @@ def make_xgb_classifier(args: argparse.Namespace, y_train: np.ndarray) -> XGBCla
     )
 
 
+def build_head(
+    args: argparse.Namespace,
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_val: np.ndarray,
+    y_val: np.ndarray,
+) -> Tuple[Any, str]:
+    """Fit and return the final ranking head plus its name.
+
+    ``stacked`` builds the OOF ensemble (ported from the reference model);
+    ``xgboost`` keeps the original single-booster head. Both expose
+    ``predict_proba`` so the rest of the pipeline is head-agnostic.
+    """
+    if args.head == "stacked":
+        pos = float((y_train == 1).sum())
+        neg = float((y_train == 0).sum())
+        head = StackedEnsemble(
+            scale_pos_weight=neg / max(pos, 1.0),
+            n_folds=args.stack_folds,
+            top_k=(args.stack_top_k or None),
+            use_lightgbm=not args.no_stack_lightgbm,
+            use_catboost=not args.no_stack_catboost,
+            meta_c=args.stack_meta_c,
+            random_state=args.seed,
+            n_jobs=args.xgb_n_jobs,
+        )
+        print("Training stacked ensemble head...")
+        head.fit(x_train, y_train)
+        print(f"  base learners: {head.base_names_}")
+        if head.selected_idx_ is not None:
+            print(f"  selected top-{len(head.selected_idx_)} of {x_train.shape[1]} columns")
+        return head, "stacked"
+
+    head = make_xgb_classifier(args, y_train)
+    print("Training final XGBoost head...")
+    head.fit(x_train, y_train, eval_set=[(x_val, y_val)], verbose=False)
+    return head, "xgboost"
+
+
 def predict_xgb_scores(model: Any, x: np.ndarray) -> np.ndarray:
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(x)
@@ -405,17 +447,21 @@ def save_artifact(
     xgb_metrics: Dict[str, Any] | None,
     xgb_input_dim: int | None,
     calibrator: ScoreCalibrator | None = None,
+    head_name: str = "xgboost",
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     artifact = {
-        "architecture": f"v2_action_transformer_hand_{model.chunk_encoder}_xgboost_head",
-        "schema_version": int(model.config.get("schema_version", 2)),
-        "final_head": "xgboost",
+        "architecture": f"v3_action_transformer_hand_{model.chunk_encoder}_{head_name}_head",
+        "schema_version": int(model.config.get("schema_version", 3)),
+        "final_head": head_name,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "model_config": dict(model.config),
         "action_vectorizer": action_vectorizer.state_dict(),
         "vectorizer": vectorizer.state_dict(),
+        # `head_model` is the canonical key; `xgb_model` is kept pointing at the
+        # same object for backward-compatible inference loaders.
+        "head_model": xgb_model,
         "xgb_model": xgb_model,
         "xgb_input_dim": xgb_input_dim,
         "calibrator": calibrator.to_dict() if calibrator is not None else None,
@@ -491,6 +537,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-visible-action-window-size", type=int, default=5)
     parser.add_argument("--max-visible-action-window-size", type=int, default=8)
     parser.add_argument("--calibrate-validation-visible-actions", action="store_true")
+
+    # Final head selection. `stacked` (default) is the OOF ensemble ported from
+    # the reference model (XGBoost + ExtraTrees + RandomForest + optional
+    # LightGBM/CatBoost, combined by a logistic meta-learner) and lifts AP.
+    # `xgboost` keeps the original single-booster head.
+    parser.add_argument(
+        "--head",
+        choices=("stacked", "xgboost"),
+        default="stacked",
+        help="Final ranking head: stacked OOF ensemble (default) or single XGBoost.",
+    )
+    parser.add_argument("--stack-folds", type=int, default=5, help="OOF folds for the stacked meta-learner.")
+    parser.add_argument("--stack-top-k", type=int, default=0, help="Keep top-K important input columns (0 = all).")
+    parser.add_argument("--stack-meta-c", type=float, default=1.0, help="Inverse-reg strength of the logistic meta-learner.")
+    parser.add_argument("--no-stack-lightgbm", action="store_true", help="Exclude LightGBM from the ensemble.")
+    parser.add_argument("--no-stack-catboost", action="store_true", help="Exclude CatBoost from the ensemble.")
 
     # Final XGBoost head. This replaces the old separate model.train_xgboost step.
     parser.add_argument("--xgb-n-estimators", type=int, default=500)
@@ -760,9 +822,7 @@ def main() -> None:
     print(f"XGBoost train matrix: {x_train.shape}")
     print(f"XGBoost validation matrix: {x_val.shape}")
 
-    xgb_model = make_xgb_classifier(args, y_train)
-    print("Training final XGBoost head...")
-    xgb_model.fit(x_train, y_train, eval_set=[(x_val, y_val)], verbose=False)
+    xgb_model, head_name = build_head(args, x_train, y_train, x_val, y_val)
 
     train_scores = predict_xgb_scores(xgb_model, x_train)
     val_scores = predict_xgb_scores(xgb_model, x_val)
@@ -784,9 +844,10 @@ def main() -> None:
     )
 
     xgb_metrics = {
+        "head": head_name,
         "train": train_metrics,
         "validation": val_metrics,
-        "xgb_params": xgb_model.get_params() if hasattr(xgb_model, "get_params") else {},
+        "head_params": xgb_model.get_params() if hasattr(xgb_model, "get_params") else {},
     }
 
     # Reward-aware calibration. Fit on the held-out validation scores (the same
@@ -824,11 +885,12 @@ def main() -> None:
         xgb_metrics=xgb_metrics,
         xgb_input_dim=int(x_train.shape[1]),
         calibrator=calibrator,
+        head_name=head_name,
     )
 
     print("Training finished.")
     print(f"Saved threshold: {xgb_threshold:.6f}")
-    print(f"Saved artifact with embedded XGBoost head: {out_path}")
+    print(f"Saved artifact with embedded '{head_name}' head: {out_path}")
     print(f"Embedded reward-aware calibrator: {'yes' if calibrator else 'no'}")
 
 

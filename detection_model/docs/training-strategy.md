@@ -44,16 +44,19 @@ This split is the whole strategy: **train for ranking, calibrate for safety.**
 
 ```
 chunk (list of hands)
-  │  ActionVectorizer (v2): 6 categorical channels
-  │     [street, action_type, seat, amount_bucket, pot_flow, first_in_street]
+  │  ActionVectorizer (v3): 8 categorical channels
+  │     [street, action_type, seat, amount_bucket, pot_flow, first_in_street,
+  │      actor_role, street_position]
   │     + numeric block; per-hand meta (stack/actors/streets/hero) + hand_end
   ▼
 Action Transformer + attention pool  ──▶ hand embedding         ─┐
   + per-hand meta fusion                                          │ HierarchicalChunkClassifier
-  ▼                                                               │ (schema v2)
+  ▼                                                               │ (schema v3)
 Chunk encoder = Transformer (default) | GRU  + attention pool    │ → chunk embedding
   ▼                                                              ─┘
-concat(chunk_embedding, engineered features) ─▶ XGBoost head → raw P(bot)
+concat(chunk_embedding, engineered features) ─▶ stacked head → raw P(bot)
+  │   stacked head = {XGBoost, ExtraTrees, RandomForest, (LightGBM), (CatBoost)}
+  │                  → OOF logistic meta-learner   (--head xgboost for single booster)
   ▼
 ScoreCalibrator  (isotonic → threshold-logit remap → logit shift)   ← reward-aware
   ▼
@@ -251,3 +254,42 @@ truth — not loss:
 A healthy artifact looks like: high AP (≥ ~0.9 on the benchmark), calibrated
 FPR ≈ 0.03–0.05, recall as high as that FPR allows, and a positive score gap.
 ```
+
+---
+
+## 7. What was ported from the reference (competitor) model
+
+Three of the reference model's strengths were folded in **without giving up our
+reward-aware calibrator**, which remains the final, decisive stage:
+
+1. **Stacked OOF ensemble head (`--head stacked`, default).** Instead of a single
+   XGBoost head, the final ranker is now a diverse set of base learners —
+   XGBoost + ExtraTrees + RandomForest, plus LightGBM and CatBoost when installed
+   — combined by a logistic-regression meta-learner trained on **out-of-fold**
+   base predictions (`model/stacked.py`). Ensemble diversity lifts **AP** (65% of
+   the reward and the one quantity calibration cannot recover), and OOF stacking
+   guards against base-learner overfit. `--head xgboost` restores the old single
+   booster. Tunables: `--stack-folds`, `--stack-top-k`, `--stack-meta-c`,
+   `--no-stack-lightgbm`, `--no-stack-catboost`.
+
+2. **Richer engineered features** (`model/features.py`): bet-size distribution
+   shape (`amount_iqr_bb_scaled`, `amount_p90_bb_scaled`) and betting-rhythm /
+   turn-taking tells (`actor_switch_rate`, `max_actor_run_norm`,
+   `max_action_type_run_norm`, `long_action_hand_rate`). These capture mechanical
+   regularities the leaner feature set previously dropped.
+
+3. **Richer action tokenization** (`model/action_vectorizer.py`, schema **v3**):
+   two new categorical channels — `actor_role` (the acting seat's position
+   relative to the button) and `street_position` (the action's ordinal index
+   within its street). Bots are often position-agnostic and act in mechanical
+   order; humans are strongly positional.
+
+> **Retrain required.** The new channels bump the artifact schema to **v3**, so
+> existing v2 `.pt` artifacts will no longer load — retrain with
+> `python -m model.train_hierarchical` (the recommended recipe in Section 3 now
+> uses the stacked head by default) and repoint `P44_MODEL_PATH` at the new file.
+
+What we deliberately **did not** adopt: the reference model's metric-agnostic
+quantile "score spreader" calibrator. Our `ScoreCalibrator` already targets the
+exact validator reward under the FPR cliff, which is strictly better aligned to
+what the subnet pays.

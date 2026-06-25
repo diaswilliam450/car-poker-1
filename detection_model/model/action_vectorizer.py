@@ -27,11 +27,27 @@ import math
 from collections import Counter
 from typing import Any, Dict, List, Tuple
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Fixed categorical layout. Index positions are load-bearing: the model embeds
 # each channel by position, so do not reorder without retraining.
-CAT_CHANNELS = ("street", "action_type", "seat", "amount_bucket", "pot_flow", "first_in_street")
+#
+# v3 adds two channels ported from the reference stacked model:
+#   * actor_role     — the acting seat's position relative to the button
+#                      (button/SB/BB/early/middle/late). Bots often act
+#                      position-agnostically; humans are strongly positional.
+#   * street_position — this action's ordinal index within its street
+#                      (1st/2nd/3rd/4th+). Captures betting-rhythm/order tells.
+CAT_CHANNELS = (
+    "street",
+    "action_type",
+    "seat",
+    "amount_bucket",
+    "pot_flow",
+    "first_in_street",
+    "actor_role",
+    "street_position",
+)
 CAT_DIM = len(CAT_CHANNELS)
 
 # Amount buckets in BB (mirrors the canonicalization live payloads apply). Bucket
@@ -44,6 +60,13 @@ POT_FLOW_VOCAB_SIZE = 5  # pad, flat, small_up, medium_up, large_up
 
 # Per-action "first action on its street" indicator: pad / continuation / first.
 FIRST_IN_STREET_VOCAB_SIZE = 3
+
+# Actor role relative to the button: pad, unknown, button, small_blind,
+# big_blind, early, middle, late.
+ACTOR_ROLE_VOCAB_SIZE = 8
+
+# Ordinal action index within its street: pad, 1st, 2nd, 3rd, 4th+.
+STREET_POSITION_VOCAB_SIZE = 5
 
 # Deepest street the hand reached (per-hand token).
 HAND_END_TO_ID = {"<pad>": 0, "preflop": 1, "flop": 2, "turn": 3, "river": 4}
@@ -107,6 +130,8 @@ class ActionVectorizer:
     amount_bucket_vocab_size = AMOUNT_BUCKET_VOCAB_SIZE
     pot_flow_vocab_size = POT_FLOW_VOCAB_SIZE
     first_in_street_vocab_size = FIRST_IN_STREET_VOCAB_SIZE
+    actor_role_vocab_size = ACTOR_ROLE_VOCAB_SIZE
+    street_position_vocab_size = STREET_POSITION_VOCAB_SIZE
     hand_end_vocab_size = HAND_END_VOCAB_SIZE
     hand_meta_dim = HAND_META_DIM
 
@@ -189,6 +214,41 @@ class ActionVectorizer:
             return 1
         nearest = min(AMOUNT_BUCKETS_BB, key=lambda edge: abs(edge - value))
         return AMOUNT_BUCKETS_BB.index(nearest) + 1
+
+    @staticmethod
+    def _actor_role_id(actor_seat: int, button_seat: int, max_seats: int) -> int:
+        """Position of the acting seat relative to the button.
+
+        Returns: 1 unknown, 2 button, 3 small_blind, 4 big_blind,
+        5 early, 6 middle, 7 late. 0 is reserved for padding.
+        """
+        if actor_seat <= 0 or button_seat <= 0 or max_seats <= 1:
+            return 1  # unknown
+        offset = (actor_seat - button_seat) % max_seats
+        if offset == 0:
+            return 2  # button
+        if offset == 1:
+            return 3  # small blind
+        if offset == 2:
+            return 4  # big blind
+        # Split the remaining seats into early / middle / late thirds.
+        remaining = max_seats - 3
+        if remaining <= 0:
+            return 6  # middle (heads-up / very small tables)
+        rank = offset - 3  # 0-based position among the non-blind seats
+        third = rank / max(1, remaining)
+        if third < 1.0 / 3.0:
+            return 5  # early
+        if third < 2.0 / 3.0:
+            return 6  # middle
+        return 7  # late
+
+    @staticmethod
+    def _street_position_id(position_within_street: int) -> int:
+        """Ordinal index of an action within its street, capped at 4+."""
+        if position_within_street <= 0:
+            return 0
+        return min(position_within_street, 4)
 
     @staticmethod
     def _pot_flow_id(pot_before_bb: float, pot_after_bb: float) -> int:
@@ -420,12 +480,14 @@ class ActionVectorizer:
         metadata = hand.get("metadata") or {}
         bb = self.safe_float(metadata.get("bb"), default=0.0)
         hero_seat = self.safe_int(metadata.get("hero_seat"), default=0)
+        button_seat = self.safe_int(metadata.get("button_seat"), default=0)
         max_seats = self.get_hand_max_seats(hand)
         players_by_seat = self.get_players_by_seat(hand)
 
         cat_rows: List[List[int]] = []
         num_rows: List[List[float]] = []
         prev_street: str | None = None
+        street_position_counts: Dict[str, int] = {}
 
         for idx, action in enumerate(actions[: self.max_actions_per_hand]):
             if not isinstance(action, dict):
@@ -444,7 +506,10 @@ class ActionVectorizer:
             )
             first_in_street = 2 if street != prev_street else 1
             prev_street = street
-            cat_rows.append(cat_ids + [first_in_street])
+            street_position_counts[street] = street_position_counts.get(street, 0) + 1
+            actor_role_id = self._actor_role_id(actor_seat, button_seat, max_seats)
+            street_position_id = self._street_position_id(street_position_counts[street])
+            cat_rows.append(cat_ids + [first_in_street, actor_role_id, street_position_id])
             num_rows.append(numeric)
 
         if not cat_rows:

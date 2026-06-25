@@ -17,9 +17,10 @@ class Poker44BotDetector:
     Inference wrapper for the structured-action hierarchical encoder.
 
     Preferred final scoring path:
-        neural chunk embedding + engineered chunk features -> embedded XGBoost head
+        neural chunk embedding + engineered chunk features -> embedded head
+        (stacked OOF ensemble by default, or a single XGBoost head)
 
-    If an old artifact has no XGBoost head, inference falls back to the auxiliary
+    If an old artifact has no head model, inference falls back to the auxiliary
     torch probe so older checkpoints still run.
     """
 
@@ -97,7 +98,13 @@ class Poker44BotDetector:
             print(f"Loaded model with compatibility mode: missing={len(missing)}, unexpected={len(unexpected)}")
 
         threshold = float(artifact.get("threshold", 0.5))
-        xgb_model = artifact.get("xgb_model") or artifact.get("model_head")
+        # `head_model` is the canonical key (stacked ensemble or XGBoost); older
+        # artifacts only carry `xgb_model`. Both expose predict_proba.
+        xgb_model = (
+            artifact.get("head_model")
+            or artifact.get("xgb_model")
+            or artifact.get("model_head")
+        )
         calibrator = ScoreCalibrator.from_dict(artifact.get("calibrator"))
 
         if xgb_path:

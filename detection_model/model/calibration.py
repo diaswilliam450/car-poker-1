@@ -190,6 +190,7 @@ class ScoreCalibrator:
         labels: Sequence[int],
         *,
         use_isotonic: bool = True,
+        isotonic_identity_blend: float = 0.05,
         remap_temperature_grid: Sequence[float] = (0.12, 0.18, 0.25, 0.35, 0.5, 0.65, 0.85, 1.0, 1.25),
         logit_bias_grid: Sequence[float] = (-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0),
         logit_temperature_grid: Sequence[float] = (0.6, 0.8, 1.0, 1.2),
@@ -212,8 +213,19 @@ class ScoreCalibrator:
             iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
             iso.fit(raw, lab.astype(float))
             grid = np.linspace(0.0, 1.0, 256)
+            iso_y = np.clip(iso.predict(grid), 0.0, 1.0)
+            # Guarantee STRICT monotonicity. Isotonic fit on a (near-)perfectly
+            # separated split degenerates into a step function with long flat
+            # regions. A flat segment is monotone but maps an entire score
+            # interval to a single value, so on live data where most chunks fall
+            # in that interval every calibrated score collapses to a constant —
+            # ranking, and therefore AP, is destroyed even though val AP looked
+            # perfect. Blending a small slice of the identity keeps the curve
+            # strictly increasing and preserves within-region ranking.
+            blend = float(np.clip(isotonic_identity_blend, 0.0, 1.0))
+            iso_y = (1.0 - blend) * iso_y + blend * grid
             self.isotonic_x = grid.tolist()
-            self.isotonic_y = np.clip(iso.predict(grid), 0.0, 1.0).tolist()
+            self.isotonic_y = iso_y.tolist()
         post_iso = self._apply_isotonic(raw)
 
         # Stage 2: threshold-logit remap. Candidate thresholds are drawn from the

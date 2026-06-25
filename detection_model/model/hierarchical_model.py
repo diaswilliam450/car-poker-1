@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CHUNK_ENCODERS = ("transformer", "gru")
 
 
@@ -72,6 +72,8 @@ class HierarchicalChunkClassifier(nn.Module):
         amount_bucket_vocab_size: int,
         pot_flow_vocab_size: int,
         first_in_street_vocab_size: int,
+        actor_role_vocab_size: int,
+        street_position_vocab_size: int,
         hand_end_vocab_size: int,
         hand_meta_dim: int,
         max_actions_per_hand: int = 64,
@@ -118,6 +120,8 @@ class HierarchicalChunkClassifier(nn.Module):
             "amount_bucket_vocab_size": int(amount_bucket_vocab_size),
             "pot_flow_vocab_size": int(pot_flow_vocab_size),
             "first_in_street_vocab_size": int(first_in_street_vocab_size),
+            "actor_role_vocab_size": int(actor_role_vocab_size),
+            "street_position_vocab_size": int(street_position_vocab_size),
             "hand_end_vocab_size": int(hand_end_vocab_size),
             "hand_meta_dim": int(hand_meta_dim),
             "max_actions_per_hand": self.max_actions_per_hand,
@@ -140,6 +144,8 @@ class HierarchicalChunkClassifier(nn.Module):
         self.amount_bucket_embedding = nn.Embedding(amount_bucket_vocab_size, d_model, padding_idx=pad_id)
         self.pot_flow_embedding = nn.Embedding(pot_flow_vocab_size, d_model, padding_idx=pad_id)
         self.first_in_street_embedding = nn.Embedding(first_in_street_vocab_size, d_model, padding_idx=pad_id)
+        self.actor_role_embedding = nn.Embedding(actor_role_vocab_size, d_model, padding_idx=pad_id)
+        self.street_position_embedding = nn.Embedding(street_position_vocab_size, d_model, padding_idx=pad_id)
 
         self.numeric_projection = nn.Sequential(
             nn.Linear(numeric_dim, d_model), nn.LayerNorm(d_model), nn.GELU(), nn.Dropout(dropout)
@@ -205,13 +211,15 @@ class HierarchicalChunkClassifier(nn.Module):
     # ---- action -> hand ----------------------------------------------------
 
     def _embed_actions(self, action_cat: torch.Tensor, action_num: torch.Tensor) -> torch.Tensor:
-        # action_cat: [N, A, 6]
+        # action_cat: [N, A, 8]
         street = action_cat[:, :, 0].clamp(0, self.street_embedding.num_embeddings - 1)
         atype = action_cat[:, :, 1].clamp(0, self.action_type_embedding.num_embeddings - 1)
         seat = action_cat[:, :, 2].clamp(0, self.seat_embedding.num_embeddings - 1)
         amount = action_cat[:, :, 3].clamp(0, self.amount_bucket_embedding.num_embeddings - 1)
         pot_flow = action_cat[:, :, 4].clamp(0, self.pot_flow_embedding.num_embeddings - 1)
         first = action_cat[:, :, 5].clamp(0, self.first_in_street_embedding.num_embeddings - 1)
+        actor_role = action_cat[:, :, 6].clamp(0, self.actor_role_embedding.num_embeddings - 1)
+        street_pos = action_cat[:, :, 7].clamp(0, self.street_position_embedding.num_embeddings - 1)
 
         positions = torch.arange(action_cat.shape[1], device=action_cat.device).unsqueeze(0)
         positions = positions.clamp(max=self.action_position_embedding.num_embeddings - 1)
@@ -223,6 +231,8 @@ class HierarchicalChunkClassifier(nn.Module):
             + self.amount_bucket_embedding(amount)
             + self.pot_flow_embedding(pot_flow)
             + self.first_in_street_embedding(first)
+            + self.actor_role_embedding(actor_role)
+            + self.street_position_embedding(street_pos)
             + self.numeric_projection(action_num)
             + self.action_position_embedding(positions)
         )

@@ -1,10 +1,15 @@
 # Core training / inference (model/*)
 torch
 numpy
-scikit-learn      # metrics + isotonic calibration (model/scoring.py, model/calibration.py)
-xgboost           # final classifier head
+scikit-learn      # metrics, isotonic calibration, ExtraTrees/RandomForest + logistic meta-learner (stacked head)
+xgboost           # base learner in the stacked head (and the single-XGBoost head)
 tqdm              # training progress
 joblib            # optional external XGBoost artifact loading
+
+# Optional stacked-ensemble base learners. The stacked head runs without them
+# (XGBoost + ExtraTrees + RandomForest) but is stronger with them installed.
+lightgbm          # optional base learner
+catboost          # optional base learner
 
 # Data tooling (tools/get_dump.py)
 requests          # pull benchmark chunks from the Poker44 platform API
