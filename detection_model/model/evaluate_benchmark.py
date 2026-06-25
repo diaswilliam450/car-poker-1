@@ -201,6 +201,119 @@ def select_samples(
     return train_samples + val_samples
 
 
+# ---------------------------------------------------------------------------
+# Data loading that also accepts the raw validator payload (data/chunks.json)
+# ---------------------------------------------------------------------------
+
+def _load_raw_json(path: str | Path) -> Any:
+    path = Path(path)
+    if path.suffix == ".gz":
+        import gzip
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _looks_like_hand(obj: Any) -> bool:
+    return isinstance(obj, dict) and "actions" in obj and "players" in obj
+
+
+def _is_labeled_structure(raw: Any) -> bool:
+    """True when the file carries is_bot/label info (use the benchmark loader).
+
+    The raw validator payload (``data/chunks.json``) is a bare
+    ``List[List[hand]]`` with no labels, so this returns False and we score it
+    directly instead of trying to compute label-dependent reward metrics.
+    """
+    if isinstance(raw, dict):
+        for key in ("train", "training", "validation", "valid", "val", "dev",
+                    "test", "labeled_chunks", "splits"):
+            if raw.get(key):
+                return True
+        for key in ("samples", "data", "chunks", "items", "records"):
+            if isinstance(raw.get(key), list):
+                raw = raw[key]
+                break
+        else:
+            return False
+    if not isinstance(raw, list) or not raw:
+        return False
+    head = raw[0]
+    if isinstance(head, list):
+        return False  # bare chunk = list of hands -> unlabeled
+    if isinstance(head, dict):
+        return any(
+            isinstance(it, dict) and ("is_bot" in it or "label" in it)
+            for it in raw[:50]
+        )
+    return False
+
+
+def load_unlabeled_chunks(raw: Any) -> List[ChunkSample]:
+    """Build label-less samples from a raw validator-style payload.
+
+    Accepts the bare ``List[List[hand]]`` (data/chunks.json) format, a wrapper
+    dict around such a list, and label-less ``[{"hands": [...]}, ...]`` items.
+    """
+    if isinstance(raw, dict):
+        for key in ("chunks", "labeled_chunks", "samples", "data", "items", "records"):
+            if isinstance(raw.get(key), list):
+                raw = raw[key]
+                break
+    if not isinstance(raw, list):
+        raise ValueError(f"Unsupported chunks structure: {type(raw)}")
+
+    samples: List[ChunkSample] = []
+    for idx, item in enumerate(raw):
+        if isinstance(item, list):
+            chunk = item
+        elif isinstance(item, dict):
+            chunk = item.get("hands") or item.get("chunk")
+            if chunk is None and _looks_like_hand(item):
+                chunk = [item]
+        else:
+            continue
+        if not chunk:
+            continue
+        chunk_id = (item.get("chunk_id") if isinstance(item, dict) else None) or f"chunk_{idx}"
+        samples.append(ChunkSample(chunk=chunk, label=-1, chunk_id=str(chunk_id)))
+    return samples
+
+
+def load_eval_samples(path: str | Path, split: str) -> Tuple[List[ChunkSample], bool]:
+    """Return ``(samples, labeled)``.
+
+    Labeled benchmarks go through the normal train/val split logic; unlabeled
+    validator payloads (data/chunks.json) are scored as-is with ``label = -1``.
+    """
+    raw = _load_raw_json(path)
+    if _is_labeled_structure(raw):
+        train_samples, val_samples = load_public_benchmark(path)
+        return select_samples(train_samples, val_samples, split), True
+    return load_unlabeled_chunks(raw), False
+
+
+def scoring_only_metrics(scores: np.ndarray) -> Dict[str, Any]:
+    """Diagnostics for unlabeled data: distribution + predicted-class split at
+    the validator's 0.5 boundary. No reward/AP/FPR — those need labels."""
+    n = int(len(scores))
+    preds = np.round(scores).astype(np.int32)
+    pred_bot = int(preds.sum())
+    return {
+        "count": n,
+        "labeled": False,
+        "boundary": "validator np.round (0.5)",
+        "score_min": float(scores.min()) if n else 0.0,
+        "score_max": float(scores.max()) if n else 0.0,
+        "score_mean": float(scores.mean()) if n else 0.0,
+        "score_std": float(scores.std()) if n else 0.0,
+        "pred_bot": pred_bot,
+        "pred_human": n - pred_bot,
+        "pred_bot_rate": float(pred_bot / n) if n else 0.0,
+    }
+
+
 def make_windows_for_chunk(
     chunk: List[Dict[str, Any]],
     window_hands: int,
@@ -402,6 +515,7 @@ def build_rows(
 
     for idx, (sample, score) in enumerate(zip(samples, scores)):
         label = int(sample.label)
+        labeled = label >= 0
         # Same boundary the validator uses (np.round), so per-chunk predictions
         # match the confusion matrix and validator_* metrics.
         pred = int(np.round(score))
@@ -412,11 +526,11 @@ def build_rows(
             "idx": idx,
             "chunk_id": chunk_id,
             "label": label,
-            "label_name": "bot" if label == 1 else "human",
+            "label_name": ("bot" if label == 1 else "human") if labeled else "unknown",
             "score": float(score),
             "prediction": pred,
             "prediction_name": "bot" if pred == 1 else "human",
-            "correct": int(label == pred),
+            "correct": int(label == pred) if labeled else None,
             "chunk_size_hands": len(sample.chunk),
         }
 
@@ -462,15 +576,16 @@ def main() -> None:
             "--window-inference evaluates original chunks by aggregating window scores."
         )
 
-    print(f"Loading benchmark: {args.data}")
-    train_samples, val_samples = load_public_benchmark(args.data)
-
-    samples = select_samples(train_samples, val_samples, args.split)
+    print(f"Loading data: {args.data}")
+    samples, labeled = load_eval_samples(args.data, args.split)
 
     if not samples:
         raise RuntimeError(f"No samples found for split: {args.split}")
 
     print(f"Original selected chunks: {len(samples)}")
+    if not labeled:
+        print("No labels detected -> scoring-only mode "
+              "(validator reward/FPR/recall need labels and are skipped).")
 
     # Mode 1:
     # Evaluate generated windows directly as samples.
@@ -500,8 +615,11 @@ def main() -> None:
 
     print(f"Evaluating split: {args.split}")
     print(f"Evaluation rows: {len(samples)}")
-    print(f"Human labels: {int((labels == 0).sum())}")
-    print(f"Bot labels: {int((labels == 1).sum())}")
+    if labeled:
+        print(f"Human labels: {int((labels == 0).sum())}")
+        print(f"Bot labels: {int((labels == 1).sum())}")
+    else:
+        print("Labels: none (unlabeled scoring-only)")
     print("Boundary: validator np.round (0.5)")
     print(f"XGBoost enabled: {bool(getattr(detector, 'xgb_model', None))}")
 
@@ -542,7 +660,11 @@ def main() -> None:
 
     scores_arr = np.asarray(scores, dtype=np.float32)
 
-    metrics = safe_metrics(labels, scores_arr)
+    if labeled:
+        metrics = safe_metrics(labels, scores_arr)
+        metrics["labeled"] = True
+    else:
+        metrics = scoring_only_metrics(scores_arr)
 
     metrics["split"] = args.split
     metrics["model"] = str(args.model)
@@ -568,40 +690,43 @@ def main() -> None:
         if "num_windows" in row:
             extra = f" windows={row['num_windows']}"
 
+        correct = "-" if row["correct"] is None else row["correct"]
         print(
             f"idx={row['idx']:04d} "
             f"chunk_id={row['chunk_id']} "
-            f"label={row['label_name']:<5} "
+            f"label={row['label_name']:<7} "
             f"score={row['score']:.6f} "
             f"pred={row['prediction_name']:<5} "
-            f"correct={row['correct']} "
+            f"correct={correct} "
             f"hands={row['chunk_size_hands']}"
             f"{extra}"
         )
 
-    print(f"\n=== First {args.show} mistakes ===")
-    mistake_rows = [row for row in rows if row["correct"] == 0]
+    # Mistakes need ground-truth labels; skip entirely for unlabeled data.
+    if labeled:
+        print(f"\n=== First {args.show} mistakes ===")
+        mistake_rows = [row for row in rows if row["correct"] == 0]
 
-    mistake_rows = sorted(
-        mistake_rows,
-        key=lambda r: abs(float(r["score"]) - float(r["label"])),
-        reverse=True,
-    )
-
-    for row in mistake_rows[: args.show]:
-        extra = ""
-        if "num_windows" in row:
-            extra = f" windows={row['num_windows']}"
-
-        print(
-            f"idx={row['idx']:04d} "
-            f"chunk_id={row['chunk_id']} "
-            f"label={row['label_name']:<5} "
-            f"score={row['score']:.6f} "
-            f"pred={row['prediction_name']:<5} "
-            f"hands={row['chunk_size_hands']}"
-            f"{extra}"
+        mistake_rows = sorted(
+            mistake_rows,
+            key=lambda r: abs(float(r["score"]) - float(r["label"])),
+            reverse=True,
         )
+
+        for row in mistake_rows[: args.show]:
+            extra = ""
+            if "num_windows" in row:
+                extra = f" windows={row['num_windows']}"
+
+            print(
+                f"idx={row['idx']:04d} "
+                f"chunk_id={row['chunk_id']} "
+                f"label={row['label_name']:<7} "
+                f"score={row['score']:.6f} "
+                f"pred={row['prediction_name']:<5} "
+                f"hands={row['chunk_size_hands']}"
+                f"{extra}"
+            )
 
     if args.out_csv:
         save_csv(args.out_csv, rows)
