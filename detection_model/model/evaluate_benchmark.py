@@ -61,11 +61,23 @@ def parse_args() -> argparse.Namespace:
         help="Inference batch size.",
     )
 
-    # NOTE: there is intentionally no --threshold flag. The validator classifies
-    # with a hard np.round(score) (boundary 0.5) and the embedded calibrator is
-    # what positions the scores against it, so every metric here is reported at
-    # that exact boundary. A custom threshold would only diverge from how you are
-    # actually scored on-chain.
+    # By default classification uses the validator's EXACT boundary: a hard
+    # np.round(score) (0.5, with 0.5 rounding down to human), and the embedded
+    # calibrator is what positions scores against it. --boundary overrides the
+    # cut everywhere: the confusion matrix / precision / recall / f1 / accuracy,
+    # the per-chunk predictions, AND the validator_* reward block (FPR and recall
+    # move; AP is rank-based and unchanged). On-chain the validator always uses
+    # 0.5, so a custom boundary is a what-if: the reward a calibrator that maps
+    # that boundary to 0.5 would bank.
+    parser.add_argument(
+        "--boundary",
+        type=float,
+        default=None,
+        help="Decision boundary applied to all classification + reward metrics "
+        "(default: validator np.round at 0.5). A score >= boundary is predicted "
+        "bot. AP is rank-based and unaffected. Use it to simulate reward/FPR/"
+        "recall at a different cut; on-chain the validator always uses 0.5.",
+    )
 
     parser.add_argument(
         "--device",
@@ -294,16 +306,32 @@ def load_eval_samples(path: str | Path, split: str) -> Tuple[List[ChunkSample], 
     return load_unlabeled_chunks(raw), False
 
 
-def scoring_only_metrics(scores: np.ndarray) -> Dict[str, Any]:
+def classify_at_boundary(scores: np.ndarray, boundary: Optional[float]) -> np.ndarray:
+    """Predicted labels at the decision boundary.
+
+    ``boundary is None`` reproduces the validator EXACTLY (``np.round``, so 0.5
+    rounds down to human). A float uses ``score >= boundary`` -> bot.
+    """
+    arr = np.asarray(scores, dtype=np.float64)
+    if boundary is None:
+        return np.round(arr).astype(np.int32)
+    return (arr >= float(boundary)).astype(np.int32)
+
+
+def boundary_label(boundary: Optional[float]) -> str:
+    return "validator np.round (0.5)" if boundary is None else f"score >= {float(boundary):.4f}"
+
+
+def scoring_only_metrics(scores: np.ndarray, boundary: Optional[float] = None) -> Dict[str, Any]:
     """Diagnostics for unlabeled data: distribution + predicted-class split at
-    the validator's 0.5 boundary. No reward/AP/FPR — those need labels."""
+    the chosen boundary (default validator 0.5). No reward/AP/FPR — need labels."""
     n = int(len(scores))
-    preds = np.round(scores).astype(np.int32)
+    preds = classify_at_boundary(scores, boundary)
     pred_bot = int(preds.sum())
     return {
         "count": n,
         "labeled": False,
-        "boundary": "validator np.round (0.5)",
+        "boundary": boundary_label(boundary),
         "score_min": float(scores.min()) if n else 0.0,
         "score_max": float(scores.max()) if n else 0.0,
         "score_mean": float(scores.mean()) if n else 0.0,
@@ -430,18 +458,19 @@ def predict_original_chunks_with_windows(
 def safe_metrics(
     labels: np.ndarray,
     scores: np.ndarray,
+    boundary: Optional[float] = None,
 ) -> Dict[str, Any]:
-    # Classify at the validator's EXACT boundary so every metric below
-    # reconciles with the validator_* block. The validator does
-    # `preds = np.round(scores)` (0.5 rounds DOWN to human), nothing else.
-    # Using `scores >= threshold` with any other threshold is what made the
-    # confusion matrix disagree with validator_fpr.
-    preds = np.round(scores).astype(np.int32)
+    # Classify at the chosen boundary. With the default (boundary=None) this is
+    # the validator's EXACT rule -- `preds = np.round(scores)` (0.5 rounds DOWN
+    # to human). A custom --boundary moves the confusion matrix / precision /
+    # recall / f1 AND the validator_* reward block below (both use this boundary),
+    # so the two stay consistent with each other.
+    preds = classify_at_boundary(scores, boundary)
 
     metrics: Dict[str, Any] = {}
 
     metrics["count"] = int(len(labels))
-    metrics["boundary"] = "validator np.round (0.5)"
+    metrics["boundary"] = boundary_label(boundary)
 
     metrics["human_count"] = int((labels == 0).sum())
     metrics["bot_count"] = int((labels == 1).sum())
@@ -494,8 +523,10 @@ def safe_metrics(
         metrics["brier"] = None
 
     # The numbers the validator actually pays on, computed on the (calibrated)
-    # scores exactly as the on-chain reward does. validator_fpr must stay < 0.10.
-    reward = reward_metrics(labels, scores)
+    # scores as the on-chain reward does. With the default boundary this is the
+    # exact 0.5 rule (validator_fpr must stay < 0.10); a custom --boundary shows
+    # the what-if reward/FPR/recall at that cut (AP is rank-based, so unchanged).
+    reward = reward_metrics(labels, scores, boundary=boundary)
     metrics["validator_reward"] = reward["validator_reward"]
     metrics["validator_fpr"] = reward["validator_fpr"]
     metrics["validator_bot_recall"] = reward["validator_bot_recall"]
@@ -510,15 +541,16 @@ def build_rows(
     samples: List[ChunkSample],
     scores: List[float],
     window_counts: Optional[List[int]] = None,
+    boundary: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
 
     for idx, (sample, score) in enumerate(zip(samples, scores)):
         label = int(sample.label)
         labeled = label >= 0
-        # Same boundary the validator uses (np.round), so per-chunk predictions
-        # match the confusion matrix and validator_* metrics.
-        pred = int(np.round(score))
+        # Per-chunk prediction at the chosen boundary (default validator np.round),
+        # so it matches the confusion matrix above.
+        pred = int(classify_at_boundary([score], boundary)[0])
 
         chunk_id = getattr(sample, "chunk_id", None) or f"chunk_{idx}"
 
@@ -620,7 +652,7 @@ def main() -> None:
         print(f"Bot labels: {int((labels == 1).sum())}")
     else:
         print("Labels: none (unlabeled scoring-only)")
-    print("Boundary: validator np.round (0.5)")
+    print(f"Boundary: {boundary_label(args.boundary)}")
     print(f"XGBoost enabled: {bool(getattr(detector, 'xgb_model', None))}")
 
     # Mode 2:
@@ -661,10 +693,10 @@ def main() -> None:
     scores_arr = np.asarray(scores, dtype=np.float32)
 
     if labeled:
-        metrics = safe_metrics(labels, scores_arr)
+        metrics = safe_metrics(labels, scores_arr, boundary=args.boundary)
         metrics["labeled"] = True
     else:
-        metrics = scoring_only_metrics(scores_arr)
+        metrics = scoring_only_metrics(scores_arr, boundary=args.boundary)
 
     metrics["split"] = args.split
     metrics["model"] = str(args.model)
@@ -679,6 +711,7 @@ def main() -> None:
         samples=samples,
         scores=scores,
         window_counts=window_counts,
+        boundary=args.boundary,
     )
 
     print("\n=== Metrics ===")

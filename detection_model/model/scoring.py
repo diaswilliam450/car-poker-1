@@ -33,7 +33,7 @@ This module is intentionally dependency-light (numpy + scikit-learn) so the
 
 from __future__ import annotations
 
-from typing import Dict, Sequence
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 from sklearn.metrics import average_precision_score, confusion_matrix
@@ -47,17 +47,32 @@ AP_WEIGHT = 0.65
 RECALL_WEIGHT = 0.35
 
 
-def validator_reward(scores: np.ndarray, labels: np.ndarray) -> tuple[float, Dict[str, float]]:
-    """Reproduce the on-chain validator reward exactly.
+def validator_reward(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    boundary: Optional[float] = None,
+) -> tuple[float, Dict[str, float]]:
+    """Reproduce the on-chain validator reward.
 
     ``scores`` are bot-risk probabilities in ``[0, 1]`` (higher = more bot-like).
     ``labels`` are 0 (human) / 1 (bot). Returns ``(reward, details)`` where
     ``details`` carries the component breakdown for diagnostics.
+
+    ``boundary`` controls how scores become predictions. ``None`` (default)
+    reproduces the validator EXACTLY (``np.round``, so 0.5 rounds down to human).
+    A float classifies ``score >= boundary`` as bot, which moves FPR and recall
+    (and therefore the reward) — a *what-if* for boundary placement. AP is
+    rank-based and unaffected. On-chain the validator always uses 0.5, so a custom
+    boundary answers "what reward would I get if the cut were here" — i.e. what a
+    calibrator that maps this boundary to 0.5 would bank.
     """
     scores = np.asarray(scores, dtype=float)
     labels = np.asarray(labels, dtype=int)
 
-    preds = np.round(scores).astype(int)
+    if boundary is None:
+        preds = np.round(scores).astype(int)
+    else:
+        preds = (scores >= float(boundary)).astype(int)
     tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
 
     negatives = max(tn + fp, 1)
@@ -90,19 +105,23 @@ def validator_reward(scores: np.ndarray, labels: np.ndarray) -> tuple[float, Dic
 def reward_metrics(
     labels: Sequence[int],
     scores: Sequence[float],
+    boundary: Optional[float] = None,
 ) -> Dict[str, float]:
     """Full reward-aware metric bundle for one set of scored chunks.
 
     Combines the validator reward with the score-separation diagnostics that
     explain *why* a reward is high or low: where humans top out, where bots
     bottom out, and how wide the gap at the 0.5 decision boundary is.
+
+    ``boundary`` is forwarded to :func:`validator_reward` (``None`` = the exact
+    on-chain 0.5 rule); set it to simulate the reward at a different cut.
     """
     labels = [int(v) for v in labels]
     safe = [float(max(0.0, min(1.0, v))) for v in scores]
     arr = np.asarray(safe, dtype=float)
     lab = np.asarray(labels, dtype=int)
 
-    _, details = validator_reward(arr, lab)
+    _, details = validator_reward(arr, lab, boundary=boundary)
     metrics: Dict[str, float] = {
         "validator_reward": details["reward"],
         "validator_fpr": details["fpr"],
