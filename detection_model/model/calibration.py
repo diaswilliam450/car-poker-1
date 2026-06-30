@@ -6,11 +6,19 @@ validator uses (``round(score)`` at 0.5) may sit in the wrong place, and a few
 humans drifting above 0.5 can trip the 10% FPR cliff that zeroes the reward.
 
 :class:`ScoreCalibrator` is a small, serializable post-processor that fixes the
-score *geometry* without retraining the model. It applies up to three monotone
+score *geometry* without retraining the model. It applies up to four monotone
 stages, in this fixed order::
 
-    raw ──▶ isotonic ──▶ threshold_logit remap ──▶ logit shift ──▶ calibrated
+    raw ──▶ quantile spread ──▶ isotonic ──▶ threshold_logit remap ──▶ logit shift ──▶ calibrated
 
+* **quantile spread** (optional): a monotone empirical-CDF spreader (blended
+  with the identity) borrowed from the heterogeneous-stack miner. Its sole job
+  is *anti-collapse*: when the head emits all scores in a narrow band (e.g. an
+  out-of-distribution chunk length squashing the embedding), the raw scores
+  carry rank information but no usable spread, and every downstream boundary
+  lands on the wrong side. Re-expanding the band toward uniform restores the
+  separation the later stages need. Monotone, so AP is untouched in-distribution;
+  it is insurance that pays off only when a band collapses.
 * **isotonic** (optional): a monotone recalibration fit on held-out scores so
   the score is a better-behaved probability for average precision.
 * **threshold_logit remap**: ``sigmoid((s - threshold) / temperature)``. Recenters
@@ -53,6 +61,38 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
 def _logit(p: np.ndarray) -> np.ndarray:
     p = np.clip(p, 1e-6, 1.0 - 1e-6)
     return np.log(p / (1.0 - p))
+
+
+def fit_quantile_spread(
+    scores: np.ndarray,
+    *,
+    blend: float = 0.9,
+    n_knots: int = 256,
+) -> Optional[Tuple[List[float], List[float]]]:
+    """Fit a monotone empirical-CDF spreader on a fixed [0, 1] grid.
+
+    Returns ``(grid, y)`` knot lists for ``np.interp`` (same storage pattern as
+    isotonic), or ``None`` when the input has no spread to learn from. The map is
+    ``y = blend * empiricalCDF(grid) + (1 - blend) * grid``: at ``blend=1`` it is
+    the pure rank transform (output ~uniform), at ``blend=0`` it is the identity.
+    Strictly monotone by construction, so it never reorders scores.
+    """
+    raw = np.asarray(scores, dtype=float)
+    raw = raw[np.isfinite(raw)]
+    if raw.size < 8 or float(np.ptp(raw)) < 1e-9:
+        return None  # constant / degenerate band: nothing to spread
+    blend = float(np.clip(blend, 0.0, 1.0))
+    n_knots = int(max(8, n_knots))
+    grid = np.linspace(0.0, 1.0, n_knots)
+    sorted_raw = np.sort(np.clip(raw, 0.0, 1.0))
+    # Empirical CDF of the calibration scores evaluated on the grid -> rank in [0, 1].
+    cdf = np.searchsorted(sorted_raw, grid, side="right") / float(sorted_raw.size)
+    y = blend * cdf + (1.0 - blend) * grid
+    # Guarantee strict monotonicity for np.interp stability.
+    y = np.maximum.accumulate(y)
+    y = y + np.linspace(0.0, 1e-6, n_knots)
+    y = _clamp01(y)
+    return grid.tolist(), y.tolist()
 
 
 def _threshold_logit(scores: np.ndarray, threshold: float, temperature: float) -> np.ndarray:
@@ -127,6 +167,8 @@ class ScoreCalibrator:
     def __init__(
         self,
         *,
+        spread_x: Optional[List[float]] = None,
+        spread_y: Optional[List[float]] = None,
         isotonic_x: Optional[List[float]] = None,
         isotonic_y: Optional[List[float]] = None,
         remap: Optional[Dict[str, float]] = None,
@@ -136,6 +178,8 @@ class ScoreCalibrator:
         target_fpr: float = 0.04,
         max_fpr: float = 0.05,
     ) -> None:
+        self.spread_x = spread_x
+        self.spread_y = spread_y
         self.isotonic_x = isotonic_x
         self.isotonic_y = isotonic_y
         self.remap = remap or {}
@@ -146,6 +190,13 @@ class ScoreCalibrator:
         self.max_fpr = float(max_fpr)
 
     # ------------------------------------------------------------------ apply
+
+    def _apply_spread(self, scores: np.ndarray) -> np.ndarray:
+        if not self.spread_x or not self.spread_y:
+            return _clamp01(scores)
+        xp = np.asarray(self.spread_x, dtype=float)
+        fp = np.asarray(self.spread_y, dtype=float)
+        return _clamp01(np.interp(np.clip(scores, 0.0, 1.0), xp, fp))
 
     def _apply_isotonic(self, scores: np.ndarray) -> np.ndarray:
         if not self.isotonic_x or not self.isotonic_y:
@@ -166,8 +217,9 @@ class ScoreCalibrator:
         )
 
     def transform(self, scores: Sequence[float]) -> np.ndarray:
-        """Apply isotonic -> remap -> logit shift, in that order."""
+        """Apply quantile spread -> isotonic -> remap -> logit shift, in order."""
         out = np.asarray(scores, dtype=float)
+        out = self._apply_spread(out)
         out = self._apply_isotonic(out)
         out = self._apply_remap(out)
         out = _logit_shift(out, self.logit_bias, self.logit_temperature)
@@ -176,7 +228,8 @@ class ScoreCalibrator:
     @property
     def is_identity(self) -> bool:
         return (
-            not self.isotonic_x
+            not self.spread_x
+            and not self.isotonic_x
             and not self.remap
             and abs(self.logit_bias) < 1e-12
             and abs(self.logit_temperature - 1.0) < 1e-12
@@ -189,6 +242,9 @@ class ScoreCalibrator:
         scores: Sequence[float],
         labels: Sequence[int],
         *,
+        use_spread: bool = True,
+        spread_blend: float = 0.9,
+        spread_knots: int = 256,
         use_isotonic: bool = True,
         isotonic_identity_blend: float = 0.05,
         remap_temperature_grid: Sequence[float] = (0.12, 0.18, 0.25, 0.35, 0.5, 0.65, 0.85, 1.0, 1.25),
@@ -207,11 +263,23 @@ class ScoreCalibrator:
         if raw.size == 0 or lab.sum() == 0 or lab.sum() == lab.size:
             return self  # need both classes to calibrate; leave as identity
 
+        # Stage 0: quantile spread (monotone anti-collapse). Fit on the raw
+        # calibration scores; all later stages then operate on the spread output.
+        # Because the map is monotone, ranking/AP is unchanged and the remap below
+        # re-optimizes the boundary, so held-out reward is never hurt -- the spread
+        # only earns its keep when a live score band collapses.
+        self.spread_x = self.spread_y = None
+        if use_spread:
+            knots = fit_quantile_spread(raw, blend=spread_blend, n_knots=spread_knots)
+            if knots is not None:
+                self.spread_x, self.spread_y = knots
+        base = self._apply_spread(raw)
+
         # Stage 1: isotonic recalibration (monotone, preserves ranking).
         self.isotonic_x = self.isotonic_y = None
         if use_isotonic and IsotonicRegression is not None and len(set(lab.tolist())) >= 2:
             iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-            iso.fit(raw, lab.astype(float))
+            iso.fit(base, lab.astype(float))
             grid = np.linspace(0.0, 1.0, 256)
             iso_y = np.clip(iso.predict(grid), 0.0, 1.0)
             # Guarantee STRICT monotonicity. Isotonic fit on a (near-)perfectly
@@ -226,7 +294,7 @@ class ScoreCalibrator:
             iso_y = (1.0 - blend) * iso_y + blend * grid
             self.isotonic_x = grid.tolist()
             self.isotonic_y = iso_y.tolist()
-        post_iso = self._apply_isotonic(raw)
+        post_iso = self._apply_isotonic(base)
 
         # Stage 2: threshold-logit remap. Candidate thresholds are drawn from the
         # human/bot score quantiles plus a few fixed anchors, so the boundary is
@@ -297,6 +365,8 @@ class ScoreCalibrator:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "kind": "score_calibrator_v1",
+            "spread_x": self.spread_x,
+            "spread_y": self.spread_y,
             "isotonic_x": self.isotonic_x,
             "isotonic_y": self.isotonic_y,
             "remap": dict(self.remap),
@@ -312,6 +382,8 @@ class ScoreCalibrator:
         if not state or state.get("kind") != "score_calibrator_v1":
             return None
         return cls(
+            spread_x=state.get("spread_x"),
+            spread_y=state.get("spread_y"),
             isotonic_x=state.get("isotonic_x"),
             isotonic_y=state.get("isotonic_y"),
             remap=state.get("remap"),
@@ -331,6 +403,7 @@ class ScoreCalibrator:
             self.transform(raw_scores), np.asarray(labels, int)
         )
         return (
+            f"spread={'on' if self.spread_x else 'off'} "
             f"remap={self.remap or None} logit_bias={self.logit_bias:.4f} "
             f"logit_temp={self.logit_temperature:.4f} isotonic={'on' if self.isotonic_x else 'off'} | "
             f"reward {reward_before:.4f}->{reward_after:.4f} "

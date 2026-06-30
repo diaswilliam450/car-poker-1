@@ -597,6 +597,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable the isotonic recalibration stage (keep only remap + logit shift).",
     )
+    parser.add_argument(
+        "--calibration-spread",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fit a monotone quantile-spread anti-collapse stage (default on). "
+        "Re-expands collapsed score bands; AP-invariant in-distribution.",
+    )
+    parser.add_argument(
+        "--calibration-spread-blend",
+        type=float,
+        default=0.9,
+        help="Spread strength: 1.0 = pure rank/uniform, 0.0 = identity (no spread).",
+    )
 
     return parser.parse_args()
 
@@ -862,7 +875,13 @@ def main() -> None:
             target_fpr=args.calibration_target_fpr,
             max_fpr=args.calibration_max_fpr,
         )
-        calibrator.fit(val_scores, y_val, use_isotonic=not args.no_calibration_isotonic)
+        calibrator.fit(
+            val_scores,
+            y_val,
+            use_spread=args.calibration_spread,
+            spread_blend=args.calibration_spread_blend,
+            use_isotonic=not args.no_calibration_isotonic,
+        )
         print("  " + calibrator.summary(y_val, val_scores))
         print_reward_diagnostics(
             "validation (calibrated)", y_val, calibrator.transform(val_scores)
