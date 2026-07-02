@@ -122,6 +122,16 @@ class Miner(BaseMinerNeuron):
         self.inference_batch_size = int(os.getenv("P44_INFERENCE_BATCH_SIZE", "64"))
         self.prediction_threshold = float(os.getenv("P44_PREDICTION_THRESHOLD", "0.5"))
 
+        # Top-K bot cap. When enabled, only the K highest-scoring chunks in a
+        # synapse are pushed above the 0.5 boundary (classified bot); every other
+        # chunk is forced below 0.5 (human). This hard-caps false positives to
+        # protect the validator's FPR cliff. P44_TOP_K is an absolute count;
+        # P44_TOP_K_FRAC (0..1) is a batch-relative fraction used when the
+        # absolute count is unset (more robust to varying synapse sizes). Both
+        # default to disabled (0) -> scores pass through unchanged.
+        self.top_k = int(os.getenv("P44_TOP_K", "0"))
+        self.top_k_frac = float(os.getenv("P44_TOP_K_FRAC", "0"))
+
         self.detector = None
         self.model_manifest = self._build_model_manifest(repo_root, model_repo_root)
         self.manifest_compliance = evaluate_manifest_compliance(self.model_manifest)
@@ -321,6 +331,48 @@ class Miner(BaseMinerNeuron):
             calibrated = 0.5 + ((score - threshold) / (1.0 - threshold)) * 0.5
         return round(max(0.0, min(1.0, calibrated)), 6)
 
+    # ------------------------------------------------------------------ top-k
+
+    def _resolve_top_k(self, n: int) -> int:
+        """Effective K for a batch of ``n`` chunks (0 = disabled / no-op)."""
+        if self.top_k and self.top_k > 0:
+            return min(self.top_k, n)
+        if self.top_k_frac and self.top_k_frac > 0.0:
+            return max(1, min(n, int(round(self.top_k_frac * n))))
+        return 0
+
+    def _apply_top_k(self, scores: list[float]) -> list[float]:
+        """Force only the top-K scores above 0.5, everyone else below.
+
+        Ranking is preserved exactly (the validator's average-precision term is
+        rank-based, so it is unaffected). Membership in the "bot" set is decided
+        by rank — not by a value threshold — so ties across the boundary can
+        never leak an extra positive: the batch ends with *exactly* K chunks at
+        risk >= 0.5. Within each band the original score spacing is kept via a
+        min-max rescale so the miner still emits a graded, monotone signal.
+        """
+        n = len(scores)
+        k = self._resolve_top_k(n)
+        if k <= 0 or k >= n:
+            return scores  # disabled, or no "extra" chunks to demote -> no-op
+
+        order = sorted(range(n), key=lambda i: (scores[i], i), reverse=True)
+        bot_idx = set(order[:k])
+        bot_vals = [scores[i] for i in order[:k]]
+        hum_vals = [scores[i] for i in order[k:]]
+        b_lo, b_hi = min(bot_vals), max(bot_vals)
+        h_lo, h_hi = min(hum_vals), max(hum_vals)
+
+        out: list[float] = []
+        for i, s in enumerate(scores):
+            if i in bot_idx:
+                frac = 0.0 if b_hi == b_lo else (s - b_lo) / (b_hi - b_lo)
+                out.append(round(0.5 + 1e-6 + frac * (0.5 - 1e-6), 6))  # (0.5, 1.0]
+            else:
+                frac = 0.0 if h_hi == h_lo else (s - h_lo) / (h_hi - h_lo)
+                out.append(round(frac * (0.5 - 1e-6), 6))  # [0.0, 0.5)
+        return out
+
     # ----------------------------------------------------------------- serve
 
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
@@ -345,14 +397,17 @@ class Miner(BaseMinerNeuron):
                 raise ValueError(f"Wrong score count: chunks={len(chunks)}, scores={len(raw_scores)}")
 
             scores = [self._finalize_score(s) for s in raw_scores]
+            scores = self._apply_top_k(scores)
             synapse.risk_scores = scores
             synapse.predictions = [s >= 0.5 for s in scores]
             synapse.model_manifest = dict(self.model_manifest)
 
+            effective_k = self._resolve_top_k(len(scores))
             bt.logging.info(
                 f"Scored {len(chunks)} chunks with "
                 f"{'trained v2 model' if self.detector else 'heuristic fallback'} | "
                 f"window_hands={self.window_hands} stride={self.window_stride} agg={self.window_agg} | "
+                f"top_k={effective_k or 'off'} bots={sum(s >= 0.5 for s in scores)} | "
                 f"preview={scores}"
             )
             return synapse
