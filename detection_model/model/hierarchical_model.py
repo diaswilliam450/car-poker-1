@@ -15,8 +15,11 @@ What v2 adds over v1:
   counts, hero engagement) and a deepest-street-reached embedding.
 * **Pluggable chunk encoder** — ``chunk_encoder="transformer"`` (default,
   permutation-invariant set encoder, the best inductive fit for a homogeneous
-  bag of hands) or ``"gru"`` (the original ordered bidirectional GRU). An optional
-  soft hand-position channel keeps a light ordering signal either way.
+  bag of hands), ``"gru"`` (the original ordered bidirectional GRU), or
+  ``"deepsets"`` (permutation-equivariant Deep Sets layers — each hand is updated
+  from itself plus the masked set-mean; far fewer parameters than the Transformer,
+  a strong small-data fit, and provably order-agnostic). An optional soft
+  hand-position channel keeps a light ordering signal either way.
 
 The production score still comes from the XGBoost head on
 ``concat(extract_chunk_embedding(...), engineered_features)`` plus the
@@ -32,7 +35,7 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 SCHEMA_VERSION = 3
-CHUNK_ENCODERS = ("transformer", "gru")
+CHUNK_ENCODERS = ("transformer", "gru", "deepsets")
 
 
 class _AttentionPool(nn.Module):
@@ -58,6 +61,39 @@ class _AttentionPool(nn.Module):
         if all_padded is not None and all_padded.any():
             pooled = pooled.masked_fill(all_padded.unsqueeze(-1), 0.0)
         return pooled
+
+
+class _DeepSetsLayer(nn.Module):
+    """Permutation-equivariant Deep Sets layer (Zaheer et al.).
+
+    Each hand is updated from itself concatenated with the **masked set-mean**
+    over the chunk's valid hands, then residual-added and normed. The set-mean is
+    permutation-invariant and the per-hand MLP is applied identically to every
+    element, so the whole layer is permutation-EQUIVARIANT: shuffling the hands
+    permutes the outputs identically and the downstream attention pool collapses
+    that to the same chunk embedding. There is no positional term, so — unlike the
+    GRU — it cannot fit phantom hand order. Parameter-light, which suits the small
+    labeled set.
+    """
+
+    def __init__(self, d_model: int, dropout: float) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model * 2, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, hand_mask: torch.Tensor) -> torch.Tensor:
+        mask_f = hand_mask.float().unsqueeze(-1)  # [b, h, 1]
+        denom = mask_f.sum(dim=1, keepdim=True).clamp(min=1.0)  # [b, 1, 1]
+        set_mean = (x * mask_f).sum(dim=1, keepdim=True) / denom  # [b, 1, d]
+        context = set_mean.expand(-1, x.size(1), -1)
+        delta = self.mlp(torch.cat([x, context], dim=-1))
+        out = self.norm(x + delta)
+        return out.masked_fill(~hand_mask.unsqueeze(-1), 0.0)
 
 
 class HierarchicalChunkClassifier(nn.Module):
@@ -183,6 +219,11 @@ class HierarchicalChunkClassifier(nn.Module):
             )
             self.chunk_transformer = nn.TransformerEncoder(chunk_layer, num_layers=self.chunk_layers)
             self.gru_projection = nn.Identity()
+        elif self.chunk_encoder == "deepsets":
+            self.deepsets_layers = nn.ModuleList(
+                _DeepSetsLayer(d_model, dropout) for _ in range(self.chunk_layers)
+            )
+            self.gru_projection = nn.Identity()
         else:
             gru_hidden = max(1, d_model // 2) if self.bidirectional_gru else d_model
             self.hand_gru = nn.GRU(
@@ -284,6 +325,10 @@ class HierarchicalChunkClassifier(nn.Module):
 
         if self.chunk_encoder == "transformer":
             contextual = self.chunk_transformer(hand_emb, src_key_padding_mask=~hand_mask)
+        elif self.chunk_encoder == "deepsets":
+            contextual = hand_emb
+            for layer in self.deepsets_layers:
+                contextual = layer(contextual, hand_mask)
         else:
             lengths = hand_mask.long().sum(dim=1).clamp(min=1)
             packed = pack_padded_sequence(

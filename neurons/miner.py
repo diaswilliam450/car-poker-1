@@ -1,14 +1,15 @@
-"""Poker44 miner using the trained v2 hierarchical bot-detection model.
+"""Poker44 miner using the model_v2 feature-based bot-detection model.
 
 Pipeline per validator chunk:
-    chunk -> sliding windows (P44_WINDOW_HANDS / P44_WINDOW_STRIDE)
-          -> Poker44BotDetector.predict_chunks (neural encoder + XGBoost head
-             + embedded reward-aware ScoreCalibrator)
-          -> aggregate window scores (P44_WINDOW_AGG)
-          -> one risk_score per chunk
+    chunk -> order-invariant hand/chunk features (actions sorted by action_id)
+          -> Poker44V2Detector.predict_chunks (LightGBM + embedded cliff-aware
+             monotone calibrator)
+          -> one calibrated risk_score per chunk
 
-If the trained artifact cannot be loaded, the miner falls back to a simple,
-deterministic chunk-level heuristic so it still serves valid scores.
+An optional top-K cap forces only the K highest-scoring chunks above the 0.5
+boundary (FPR protection). If the trained artifact cannot be loaded, the miner
+falls back to a simple, deterministic chunk-level heuristic so it still serves
+valid scores.
 """
 
 import hashlib
@@ -35,10 +36,10 @@ load_dotenv()
 MODEL_REPO_PATH = "detection_model"
 
 try:
-    from detection_model.model.inference import Poker44BotDetector
+    from detection_model.model_v2.inference import Poker44V2Detector
     MODEL_IMPORT_ERROR = ""
 except Exception as exc:  # pragma: no cover - keep the miner alive on import error
-    Poker44BotDetector = None
+    Poker44V2Detector = None
     MODEL_IMPORT_ERROR = str(exc)
 
 
@@ -109,17 +110,7 @@ class Miner(BaseMinerNeuron):
         repo_root = Path(__file__).resolve().parents[1]
         model_repo_root = Path(MODEL_REPO_PATH).expanduser()
 
-        self.model_path = os.getenv("P44_MODEL_PATH", "detection_model/artifacts/p44_hier_xgb_cal.pt")
-        self.xgb_path = os.getenv("P44_XGB_PATH", "")
-
-        # Must match training: window the chunk into fixed-length hand windows.
-        # window_hands must be <= the model's max_hands or hands get truncated.
-        self.window_hands = int(os.getenv("P44_WINDOW_HANDS", "20"))
-        self.window_stride = int(os.getenv("P44_WINDOW_STRIDE", "10"))
-        self.window_agg = os.getenv("P44_WINDOW_AGG", "mean").lower()
-
-        self.model_device = os.getenv("P44_MODEL_DEVICE", "cpu")
-        self.inference_batch_size = int(os.getenv("P44_INFERENCE_BATCH_SIZE", "64"))
+        self.model_path = os.getenv("P44_MODEL_PATH", "detection_model/artifacts/p44_v2_lgbm_canon.joblib")
         self.prediction_threshold = float(os.getenv("P44_PREDICTION_THRESHOLD", "0.5"))
 
         # Top-K bot cap. When enabled, only the K highest-scoring chunks in a
@@ -148,13 +139,13 @@ class Miner(BaseMinerNeuron):
         implementation_files = _existing_paths(
             [
                 Path(__file__).resolve(),
-                model_repo_root / "model" / "inference.py",
-                model_repo_root / "model" / "hierarchical_model.py",
-                model_repo_root / "model" / "action_vectorizer.py",
-                model_repo_root / "model" / "features.py",
-                model_repo_root / "model" / "stacked.py",
-                model_repo_root / "model" / "calibration.py",
-                model_repo_root / "model" / "scoring.py",
+                model_repo_root / "model_v2" / "inference.py",
+                model_repo_root / "model_v2" / "features.py",
+                model_repo_root / "model_v2" / "schema.py",
+                model_repo_root / "model_v2" / "dataset.py",
+                model_repo_root / "model_v2" / "calibrate.py",
+                model_repo_root / "model_v2" / "metrics.py",
+                model_repo_root / "model_v2" / "train.py",
             ]
         )
         artifact_sha256 = os.getenv("POKER44_MODEL_ARTIFACT_SHA256", _sha256_file(model_artifact_path))
@@ -173,10 +164,10 @@ class Miner(BaseMinerNeuron):
             implementation_files=implementation_files,
             defaults={
                 "open_source": True,
-                "model_name": os.getenv("P44_MANIFEST_MODEL_NAME", "p44-hier-xgb-cal"),
-                "model_version": os.getenv("P44_MANIFEST_MODEL_VERSION", "2.0.0"),
+                "model_name": os.getenv("P44_MANIFEST_MODEL_NAME", "p44-v2-lgbm-tabular"),
+                "model_version": os.getenv("P44_MANIFEST_MODEL_VERSION", "2.1.0"),
                 "framework": os.getenv(
-                    "P44_MANIFEST_FRAMEWORK", "pytorch-hierarchical-transformer-xgboost"
+                    "P44_MANIFEST_FRAMEWORK", "lightgbm-tabular-features"
                 ),
                 "license": os.getenv("P44_MANIFEST_LICENSE", "MIT"),
                 "repo_url": repo_url,
@@ -185,13 +176,14 @@ class Miner(BaseMinerNeuron):
                 "artifact_sha256": artifact_sha256,
                 "model_card_url": os.getenv("P44_MANIFEST_MODEL_CARD_URL", ""),
                 "training_data_statement": (
-                    "Trained only on the public Poker44 benchmark and local sliding-window "
-                    "augmentation generated from it. No validator-only evaluation data, hidden "
-                    "labels, or leaked validator payloads were used."
+                    "Trained only on the public Poker44 benchmark, canonicalized through the "
+                    "validator's public miner-payload transform to match the served distribution. "
+                    "No validator-only evaluation data, hidden labels, or leaked validator payloads "
+                    "were used."
                 ),
                 "training_data_sources": [
-                    "data/public_miner_benchmark.json.gz",
-                    "local sliding-window augmentation of public benchmark chunks",
+                    "public Poker44 benchmark chunks (api.poker44.net)",
+                    "canonicalized copies of the public benchmark (validator payload_view transform)",
                 ],
                 "private_data_attestation": (
                     "This miner does not train on validator-only evaluation data, live eval "
@@ -199,26 +191,24 @@ class Miner(BaseMinerNeuron):
                 ),
                 "data_attestation": (
                     "All training data is the public Poker44 benchmark (api.poker44.net) and "
-                    "local sliding-window augmentation derived from it. No private, scraped, or "
-                    "validator-side data is used; the published repo and commit reproduce the "
-                    "full model flow."
+                    "canonicalized copies derived from it. No private, scraped, or validator-side "
+                    "data is used; the published repo and commit reproduce the full model flow."
                 ),
                 "inference_mode": "remote",
                 "notes": (
-                    "Poker44 v2 hierarchical bot detector. Action tokens -> action Transformer "
-                    "(attention pool) -> permutation-invariant chunk Transformer (attention pool) "
-                    "-> chunk embedding; XGBoost head on concat(embedding, engineered features); "
-                    "embedded reward-aware ScoreCalibrator places the 0.5 boundary under the FPR "
-                    f"cliff. Inference windows: window_hands={self.window_hands}, "
-                    f"stride={self.window_stride}, agg={self.window_agg}. "
-                    f"Local artifact: {model_artifact_path}"
+                    "Poker44 model_v2 tabular bot detector. Order-invariant hand/chunk features "
+                    "(action-type ratios, street-reached rates, amount buckets/quantiles, entropy "
+                    "and poker-validity anomaly rates; actions sorted by action_id) -> LightGBM "
+                    "chunk classifier -> embedded monotone cliff-aware calibrator that places the "
+                    "0.5 boundary under the FPR cliff. Whole-chunk scoring, no hand-order "
+                    f"assumptions. Local artifact: {model_artifact_path}"
                 ),
             },
         )
 
     def _load_trained_model(self) -> None:
-        if Poker44BotDetector is None:
-            bt.logging.error(f"Could not import Poker44BotDetector: {MODEL_IMPORT_ERROR}")
+        if Poker44V2Detector is None:
+            bt.logging.error(f"Could not import Poker44V2Detector: {MODEL_IMPORT_ERROR}")
             bt.logging.error("Miner will use the heuristic fallback.")
             return
 
@@ -228,21 +218,19 @@ class Miner(BaseMinerNeuron):
             return
 
         try:
-            bt.logging.info(f"Loading trained v2 model from: {model_path} (device={self.model_device})")
-            self.detector = Poker44BotDetector.load(
-                model_path,
-                device=self.model_device,
-                xgb_path=self.xgb_path or None,
-            )
+            bt.logging.info(f"Loading model_v2 tabular model from: {model_path}")
+            self.detector = Poker44V2Detector.load(model_path)
             env_threshold = os.getenv("P44_PREDICTION_THRESHOLD")
             if env_threshold is not None:
                 self.prediction_threshold = float(env_threshold)
             elif hasattr(self.detector, "threshold"):
                 self.prediction_threshold = float(self.detector.threshold)
 
-            bt.logging.info("✅ Trained v2 model loaded successfully")
+            bt.logging.info("✅ model_v2 loaded successfully")
             bt.logging.info(
-                f"Embedded calibrator: {getattr(self.detector, 'has_calibrator', False)} | "
+                f"Backend: {self.detector.metadata.get('backend')} | "
+                f"features: {len(self.detector.feature_names)} | "
+                f"embedded calibrator: {getattr(self.detector, 'has_calibrator', False)} | "
                 f"threshold={self.prediction_threshold}"
             )
         except Exception as exc:
@@ -262,62 +250,21 @@ class Miner(BaseMinerNeuron):
             f"open_source={self.model_manifest.get('open_source')}"
         )
 
-    # -------------------------------------------------------------- windowing
+    # ---------------------------------------------------------------- scoring
 
-    def _make_windows_for_chunk(self, chunk: list[dict]) -> list[list[dict]]:
-        """Split one validator chunk into fixed-length consecutive hand windows."""
-        if not chunk:
-            return []
-        n = len(chunk)
-        if self.window_hands <= 0 or n < self.window_hands:
-            return [chunk]
-        stride = max(1, self.window_stride)
-        windows = [chunk[start:start + self.window_hands] for start in range(0, n - self.window_hands + 1, stride)]
-        return windows or [chunk]
-
-    def _aggregate_window_scores(self, scores: list[float]) -> float:
-        """Aggregate per-window scores into one chunk score (higher = more bot-like)."""
-        if not scores:
-            return 0.5
-        scores = [float(s) for s in scores]
-        if self.window_agg == "max":
-            value = max(scores)
-        elif self.window_agg == "min":
-            value = min(scores)
-        elif self.window_agg == "topk_mean":
-            k = min(3, len(scores))
-            value = sum(sorted(scores, reverse=True)[:k]) / k
-        else:  # mean (default, FPR-safe)
-            value = sum(scores) / len(scores)
-        return round(max(0.0, min(1.0, value)), 6)
-
-    def _predict_chunks_with_windows(self, chunks: list[list[dict]]) -> list[float]:
-        """Score original chunks via sliding windows + aggregation."""
+    def _predict_chunks(self, chunks: list[list[dict]]) -> list[float]:
+        """Whole-chunk, order-invariant scoring via the model_v2 detector."""
         if self.detector is None:
             return [self.score_chunk(chunk) for chunk in chunks]
-
-        all_windows: list[list[dict]] = []
-        ranges: list[tuple[int, int]] = []
-        cursor = 0
-        for chunk in chunks:
-            windows = self._make_windows_for_chunk(chunk)
-            ranges.append((cursor, cursor + len(windows)))
-            all_windows.extend(windows)
-            cursor += len(windows)
-
-        if not all_windows:
-            return [0.5 for _ in chunks]
-
-        window_scores = self.detector.predict_chunks(all_windows, batch_size=self.inference_batch_size)
-        return [self._aggregate_window_scores(window_scores[start:end]) for start, end in ranges]
+        return self.detector.predict_chunks(chunks)
 
     def _finalize_score(self, score: float) -> float:
         """Final value sent to the validator.
 
-        v2 artifacts embed a reward-aware ScoreCalibrator, so the detector already
-        returns a score whose 0.5 boundary is correctly placed under the FPR cliff
-        — just clamp and round. Legacy artifacts (no calibrator) fall back to the
-        old piecewise remap that pins the artifact threshold to 0.5.
+        model_v2 artifacts embed a monotone cliff-aware calibrator, so the detector
+        already returns a score whose 0.5 boundary is correctly placed under the FPR
+        cliff — just clamp and round. Artifacts without a calibrator fall back to the
+        piecewise remap that pins the artifact threshold to 0.5.
         """
         score = max(0.0, min(1.0, float(score)))
         if bool(getattr(self.detector, "has_calibrator", False)):
@@ -391,7 +338,7 @@ class Miner(BaseMinerNeuron):
                 bt.logging.warning("Trained model not loaded. Using heuristic fallback.")
                 raw_scores = [self.score_chunk(chunk) for chunk in chunks]
             else:
-                raw_scores = self._predict_chunks_with_windows(chunks)
+                raw_scores = self._predict_chunks(chunks)
 
             if len(raw_scores) != len(chunks):
                 raise ValueError(f"Wrong score count: chunks={len(chunks)}, scores={len(raw_scores)}")
@@ -405,8 +352,7 @@ class Miner(BaseMinerNeuron):
             effective_k = self._resolve_top_k(len(scores))
             bt.logging.info(
                 f"Scored {len(chunks)} chunks with "
-                f"{'trained v2 model' if self.detector else 'heuristic fallback'} | "
-                f"window_hands={self.window_hands} stride={self.window_stride} agg={self.window_agg} | "
+                f"{'model_v2 tabular' if self.detector else 'heuristic fallback'} | "
                 f"top_k={effective_k or 'off'} bots={sum(s >= 0.5 for s in scores)} | "
                 f"preview={scores}"
             )

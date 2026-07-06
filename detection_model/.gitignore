@@ -6,5 +6,7 @@ data
 mismatched
 trajectory
 dashboard
+artifacts
 
 *.json
+*.csv

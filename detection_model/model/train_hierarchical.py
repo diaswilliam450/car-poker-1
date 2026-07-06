@@ -498,10 +498,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-layers", type=int, default=1, help="Chunk encoder layers (Transformer or GRU)")
     parser.add_argument(
         "--chunk-encoder",
-        choices=("transformer", "gru"),
+        choices=("transformer", "gru", "deepsets"),
         default="transformer",
         help="Hand->chunk encoder. transformer (recommended): permutation-invariant set encoder. "
-        "gru: the original ordered bidirectional GRU.",
+        "gru: the original ordered bidirectional GRU. deepsets: permutation-equivariant Deep Sets "
+        "layers (parameter-light, order-agnostic, strong on small data).",
     )
     parser.add_argument(
         "--no-hand-position",
