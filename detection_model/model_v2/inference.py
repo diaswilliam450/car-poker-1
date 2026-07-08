@@ -34,12 +34,18 @@ class Poker44V2Detector:
         feature_names: List[str],
         threshold: float = 0.5,
         metadata: Dict[str, Any] | None = None,
+        seq_model: Any = None,
+        blend_weights: Any = None,
     ) -> None:
         self.model = model
         self.calibrator = calibrator
         self.feature_names = list(feature_names)
         self.threshold = float(threshold)
         self.metadata = dict(metadata or {})
+        # Optional TCN sequence learner blended with the LightGBM. When present,
+        # the served score is blend_weights[0]*lgbm + blend_weights[1]*tcn.
+        self.seq_model = seq_model
+        self.blend_weights = tuple(blend_weights) if blend_weights is not None else None
 
     @classmethod
     def load(cls, path: str | Path) -> "Poker44V2Detector":
@@ -49,14 +55,20 @@ class Poker44V2Detector:
         import joblib
 
         art = joblib.load(path)
-        if not isinstance(art, dict) or "model" not in art or "feature_names" not in art:
-            raise ValueError(f"Not a v2 artifact (expected keys model/calibrator/feature_names): {path}")
+        if not isinstance(art, dict) or "feature_names" not in art:
+            raise ValueError(f"Not a v2 artifact (missing feature_names): {path}")
+        # Blend artifact (LGBM + TCN) or single-model artifact.
+        lgbm = art.get("lgbm_model") or art.get("model")
+        if lgbm is None:
+            raise ValueError(f"v2 artifact has no model/lgbm_model: {path}")
         return cls(
-            model=art["model"],
+            model=lgbm,
             calibrator=art.get("calibrator") or {},
             feature_names=art["feature_names"],
             threshold=float(art.get("threshold", 0.5)),
             metadata={"backend": art.get("backend"), "val_metrics": art.get("val_metrics")},
+            seq_model=art.get("seq_model"),
+            blend_weights=art.get("blend_weights"),
         )
 
     @property
@@ -82,8 +94,13 @@ class Poker44V2Detector:
             return []
         x = self._feature_rows(chunks)
         raw = self._raw_scores(x)
+        if self.seq_model is not None and self.blend_weights is not None:
+            seq = np.asarray(self.seq_model.predict_proba(chunks))[:, 1]
+            w0, w1 = self.blend_weights
+            raw = w0 * raw + w1 * seq
+        raw = np.clip(raw, 0.0, 1.0)
         if return_raw or not self.has_calibrator:
-            return [round(float(max(0.0, min(1.0, v))), 6) for v in raw]
+            return [round(float(v), 6) for v in raw]
         cal = apply_calibrator(self.calibrator, raw)
         return [round(float(v), 6) for v in cal]
 
