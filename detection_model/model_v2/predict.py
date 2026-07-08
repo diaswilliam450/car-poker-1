@@ -20,14 +20,9 @@ import numpy as np
 
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
-from .calibrate import apply_calibrator
 from .dataset import build_feature_matrix
-
-
-def _load(model_path: str):
-    import joblib
-    art = joblib.load(Path(model_path).expanduser())
-    return art["model"], art["calibrator"], art["feature_names"]
+from .inference import Poker44V2Detector
+from .schema import load_chunks
 
 
 def _importances(model, names: List[str]) -> np.ndarray:
@@ -51,16 +46,16 @@ def main() -> None:
     ap.add_argument("--top-features", type=int, default=3)
     args = ap.parse_args()
 
-    model, cal, names = _load(args.model)
+    det = Poker44V2Detector.load(args.model)   # handles single + blend uniformly
+    names = det.feature_names
     x, _, feat_names, ids = build_feature_matrix(args.data)
     if feat_names != names:
         raise SystemExit("Feature columns of data do not match the trained model.")
 
-    raw = model.predict_proba(x)
-    raw = np.asarray(raw[:, 1] if raw.ndim == 2 else raw, dtype=float)
-    proba = apply_calibrator(cal, raw)
+    chunks = [c.hands for c in load_chunks(args.data)]
+    proba = np.asarray(det.predict_chunks(chunks), dtype=float)
 
-    imp = _importances(model, names)
+    imp = _importances(det.model, names)       # tree importances (LGBM half) for salience
     col_mean = x.mean(axis=0)
     col_std = x.std(axis=0) + 1e-9
 

@@ -146,6 +146,8 @@ class Miner(BaseMinerNeuron):
                 model_repo_root / "model_v2" / "calibrate.py",
                 model_repo_root / "model_v2" / "metrics.py",
                 model_repo_root / "model_v2" / "train.py",
+                model_repo_root / "model_v2" / "sequence_model.py",
+                model_repo_root / "model_v2" / "train_stack.py",
             ]
         )
         artifact_sha256 = os.getenv("POKER44_MODEL_ARTIFACT_SHA256", _sha256_file(model_artifact_path))

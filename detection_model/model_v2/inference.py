@@ -11,6 +11,8 @@ the LightGBM model, then passed through the embedded cliff-aware calibrator so t
 
 from __future__ import annotations
 
+import importlib
+import sys
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List
@@ -22,6 +24,35 @@ warnings.filterwarnings("ignore", message="X does not have valid feature names")
 from .calibrate import apply_calibrator
 from .features import chunk_feature_vector
 from .schema import _sort_actions
+
+
+def _alias_model_v2_packages() -> None:
+    """Make pickled model_v2 classes resolve under both package roots.
+
+    Blend artifacts embed the ``TCNSequenceModel`` class. Depending on where the
+    trainer ran, it is pickled under ``model_v2.sequence_model`` (trained via
+    ``cd detection_model; python -m model_v2.train_stack``) while the miner imports
+    ``detection_model.model_v2.sequence_model``. Without an alias joblib raises
+    ``ModuleNotFoundError: No module named 'model_v2'`` and the blend fails to load.
+    Registering each submodule under both roots in ``sys.modules`` fixes it.
+    """
+    this_pkg = __package__ or "model_v2"
+    roots = {"model_v2", "detection_model.model_v2", this_pkg}
+    submodules = (
+        "inference", "features", "schema", "dataset", "calibrate",
+        "metrics", "sequence_model", "train", "train_stack",
+    )
+    pkg_obj = sys.modules.get(this_pkg)
+    for root in roots:
+        if pkg_obj is not None:
+            sys.modules.setdefault(root, pkg_obj)
+    for name in submodules:
+        try:
+            mod = importlib.import_module(f"{this_pkg}.{name}")
+        except Exception:
+            continue
+        for root in roots:
+            sys.modules.setdefault(f"{root}.{name}", mod)
 
 
 class Poker44V2Detector:
@@ -54,6 +85,7 @@ class Poker44V2Detector:
             raise FileNotFoundError(f"v2 model artifact not found: {path}")
         import joblib
 
+        _alias_model_v2_packages()
         art = joblib.load(path)
         if not isinstance(art, dict) or "feature_names" not in art:
             raise ValueError(f"Not a v2 artifact (missing feature_names): {path}")
