@@ -1,7 +1,9 @@
-# Bittensor: pinned to 8.5.x — 9.x/10.x pull an async-substrate-interface that
-# conflicts with scalecodec on py3.12 (cyscale namespace clash) and 10.x also
-# drops nested --neuron.*/--netuid/--blacklist.* config parsing.
-bittensor==8.5.2
+# Bittensor 10.5.0 (matches the finney chain runtime; older 8.x fails to decode
+# current chain state). 10.x doesn't auto-nest custom --neuron.*/--netuid/--blacklist.*
+# config args, so poker44.utils.config._apply_cli_args re-applies them. A fresh venv
+# install pulls cyscale (not scalecodec); if both end up present, run:
+#   pip install --force-reinstall --no-deps cyscale
+bittensor==10.5.0
 pydantic>=2.6
 requests>=2.31
 python-dotenv>=1.0

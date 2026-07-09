@@ -199,7 +199,31 @@ def check_config(cls, config: "bt.Config"):
     #     bt.logging.register_primary_logger(events_logger.name)
 
 
+def _apply_cli_args(config: "bt.Config", parser: argparse.ArgumentParser) -> None:
+    """Populate the Config from the parsed CLI args.
+
+    bittensor >= 10 builds only its own namespaces (wallet/subtensor/axon/logging)
+    from a parser and fills them with DEFAULTS — it neither parses the process CLI
+    args nor nests custom dotted args (--netuid, --neuron.*, --blacklist.*). We
+    re-apply the actually-parsed values so the subnet config surface
+    (config.neuron.*, config.blacklist.*, config.netuid, plus CLI wallet/axon/
+    subtensor overrides) resolves on every bittensor version (8.x and 10.x)."""
+    parsed, _ = parser.parse_known_args()
+    for dest, value in vars(parsed).items():
+        if "." in dest:
+            namespace, _, sub = dest.partition(".")
+            current = config.get(namespace)
+            if current is None:
+                current = bt.Config()
+                config[namespace] = current
+            current[sub] = value
+        else:
+            config[dest] = value
+
+
 def config(cls) -> bt.Config:
     parser = argparse.ArgumentParser()
     cls.add_args(parser)
-    return bt.Config(parser=parser)
+    config = bt.Config(parser=parser)
+    _apply_cli_args(config, parser)
+    return config
