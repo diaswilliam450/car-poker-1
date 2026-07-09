@@ -32,17 +32,22 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 
 
 def build_model(seed: int, n_pos: int, n_neg: int):
+    # Variant p44-ngram-lgbm: regularized LightGBM over the tabular + behavioural
+    # n-gram feature space. Shallow leaves + small min_child_samples generalize on
+    # the (small) real-benchmark signal; higher reg_lambda guards against learning
+    # the planted avg_fold shortcut. (The stock min_child_samples=20 collapsed to
+    # AUC 0.5 on the 40-chunk benchmark — the shallow/low-leaf config below fixes it.)
     if _HAVE_LGBM:
         return LGBMClassifier(
-            n_estimators=400, learning_rate=0.03, num_leaves=31,
-            max_depth=-1, min_child_samples=20, subsample=0.9,
-            subsample_freq=1, colsample_bytree=0.8, reg_lambda=2.0,
+            n_estimators=350, learning_rate=0.03, num_leaves=15,
+            max_depth=-1, min_child_samples=5, subsample=0.9,
+            subsample_freq=1, colsample_bytree=0.7, reg_lambda=3.0,
             random_state=seed, n_jobs=0, verbose=-1,
             class_weight="balanced" if abs(n_pos - n_neg) > 0.1 * (n_pos + n_neg) else None,
         )
     return HistGradientBoostingClassifier(
-        max_iter=400, learning_rate=0.03, max_leaf_nodes=31,
-        l2_regularization=2.0, random_state=seed,
+        max_iter=350, learning_rate=0.03, max_leaf_nodes=15,
+        l2_regularization=3.0, min_samples_leaf=5, random_state=seed,
     )
 
 

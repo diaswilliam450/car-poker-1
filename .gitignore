@@ -212,3 +212,29 @@ hands_for_validator/poker_hands_from_rar.json
 
 # Local Weights & Biases runs/artifacts
 wandb/
+
+# ── Poker44 rebuild: push DATA, never push model artifacts or training ──
+# Trained model artifacts (regenerated locally / by the retrain job — never committed)
+*.pt
+*.joblib
+*.pkl
+*.onnx
+*.bin
+detection_model/artifacts/
+artifacts/
+
+# Training / generated datasets / experiment output (the "training folder")
+training/
+detection_model/data/
+outputs/
+detection_model/outputs/
+
+# Shared virtualenv (kept next to the projects, never committed)
+miner_env/
+../miner_env/
+.venv/
+
+# NOTE: the source DATA files below are intentionally NOT ignored (they push):
+#   detection_model/public_miner_benchmark.json.gz
+#   hands_generator/human_hands/poker_hands_combined.json.gz
+#   detection_model/model_v2/ngram_vocab.json  (frozen feature vocab)

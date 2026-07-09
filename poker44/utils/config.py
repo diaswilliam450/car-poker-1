@@ -148,6 +148,12 @@ def add_args(cls, parser: argparse.ArgumentParser) -> None:
 
 def add_validator_args(cls, parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "--neuron.name",
+        type=str,
+        default="validator",
+        help="Trials go in neuron.root/(wallet_cold - wallet_hot)/neuron.name.",
+    )
+    parser.add_argument(
         "--validator.manual_players",
         nargs="*",
         default=[],
@@ -156,6 +162,12 @@ def add_validator_args(cls, parser: argparse.ArgumentParser) -> None:
 
 
 def add_miner_args(cls, parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--neuron.name",
+        type=str,
+        default="miner",
+        help="Trials go in neuron.root/(wallet_cold - wallet_hot)/neuron.name.",
+    )
     parser.add_argument(
         "--miner.mock",
         action="store_true",

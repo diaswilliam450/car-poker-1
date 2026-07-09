@@ -1,6 +1,5 @@
 .venv
 __pycache__
-tools
 outputs
 data
 mismatched
@@ -8,5 +7,5 @@ trajectory
 dashboard
 artifacts
 
-*.json
+# generated drift reports
 *.csv

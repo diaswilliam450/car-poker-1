@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
+from .ngram_features import ngram_chunk_features, ngram_feature_names
+
 STREET_ORDER = {"preflop": 0, "flop": 1, "turn": 2, "river": 3, "showdown": 4}
 ACTION_TYPES = ("fold", "check", "call", "bet", "raise")
 # Coarse BB buckets on normalized_amount_bb (scale-invariant across datasets).
@@ -247,6 +249,7 @@ def chunk_feature_vector(hands: List[Dict[str, Any]]) -> Dict[str, float]:
                 out[f"{key}_{suf}"] = 0.0
         for k in _CHUNK_ONLY_KEYS:
             out[k] = 0.0
+        out.update(ngram_chunk_features(hands))
         return out
 
     per_hand = [extract_hand_features(h) for h in hands]
@@ -269,6 +272,7 @@ def chunk_feature_vector(hands: List[Dict[str, Any]]) -> Dict[str, float]:
         + hf["acted_after_fold_ratio"] + hf["pot_mismatch_ratio"]
         for hf in per_hand
     ]))
+    out.update(ngram_chunk_features(hands))
     return out
 
 
@@ -285,4 +289,5 @@ def feature_names_for() -> List[str]:
     for key in HAND_FEATURE_KEYS:
         names.extend(f"{key}_{suf}" for suf in _STAT_SUFFIXES)
     names.extend(_CHUNK_ONLY_KEYS)
+    names.extend(ngram_feature_names())
     return names

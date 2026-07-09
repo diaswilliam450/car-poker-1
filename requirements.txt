@@ -1,8 +1,16 @@
+# Bittensor: pinned to 8.5.x — 9.x/10.x pull an async-substrate-interface that
+# conflicts with scalecodec on py3.12 (cyscale namespace clash) and 10.x also
+# drops nested --neuron.*/--netuid/--blacklist.* config parsing.
+bittensor==8.5.2
 pydantic>=2.6
 requests>=2.31
-bittensor
 python-dotenv>=1.0
-numpy>=1.24
+numpy>=1.24,<2.1
+scipy>=1.10
 scikit-learn>=1.3
-pandas>=2.3.3
+pandas>=2.0
+joblib>=1.3
+# model_v2 detector + retrain (LightGBM primary; XGBoost used by sibling variants)
+lightgbm>=4.0
+xgboost>=2.0
 wandb>=0.19
